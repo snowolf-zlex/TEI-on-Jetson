@@ -14,11 +14,51 @@
   - [选项 A：下载预编译二进制（推荐）](#选项-a下载预编译二进制推荐1-分钟)
   - [选项 B：自己编译](#选项-b自己编译可定制5-9-小时)
 - [编译耗时实测](#编译耗时实测)
+- [使用场景](#使用场景)
 - [文件说明](#文件说明)
 - [运行时配置要点](#运行时配置要点)
 - [已知限制](#已知限制)
 - [FAQ](#faq)
 - [License](#license)
+
+## 使用场景
+
+### 什么时候需要 TEI
+
+任何需要**文本向量化（embedding）或相关性重排（reranker）**的应用：
+
+| 场景 | 用 embedding 做什么 | 用 reranker 做什么 |
+| --- | --- | --- |
+| **RAG / 知识库问答** | 文档切片向量化，存入向量数据库 | 对召回结果按相关性精排 |
+| **语义搜索** | query 向量化，与文档向量比对 | 对 top-N 结果重排提升精度 |
+| **文档去重 / 聚类** | 计算文档间相似度 | — |
+| **推荐系统** | 用户/物品向量化 | 对候选列表重排 |
+| **多语言检索** | 跨语言语义匹配（BGE-m3 支持 100+ 语言） | 跨语言相关性排序 |
+
+### 为什么本地部署而非 SaaS API
+
+| 维度 | SaaS API（硅基流动/OpenAI/Jina） | 本地 TEI |
+| --- | --- | --- |
+| **延迟** | 80-150ms（公网 RTT 主导） | **5-30ms**（内网/本地） |
+| **数据隐私** | 文本发送到第三方服务器 | **数据不出本地**（PII/敏感文档） |
+| **成本** | 按调用计费（$0.01-0.1/千次） | **零边际成本**（已摊入硬件） |
+| **离线** | 不可用 | **完全离线可用** |
+| **并发** | 受 API 限流 | 仅受 GPU 算力限制 |
+
+### 为什么选 Jetson
+
+| 设备类型 | 为什么选 / 不选 |
+| --- | --- |
+| **Jetson Orin ✅** | ARM64 + GPU + 低功耗（15-60W），适合边缘部署和私有化场景；已有 Jetson 设备可复用 |
+| 服务器 GPU（A100/H100） | 性能最强但成本高（$10K+）、功耗高（300W+）、不适合边缘场景 |
+| Mac mini | Docker 不支持 Metal GPU 直通；适合个人 LLM 推理但不适合容器化服务部署 |
+| DGX Spark | 官方 TEI 预编译镜像，最省心；但 $3,999 需额外购买 |
+
+**典型部署形态**：Jetson Orin NX 16GB 作为 Agent Studio 的推理节点，
+embedding/reranker 延迟从 SaaS API 的 80-150ms 降到 5-30ms，
+同时所有文本处理不出本地——适合隐私敏感的知识库场景。
+
+---
 
 ## 为什么需要这个项目
 
@@ -189,11 +229,41 @@ docker logs -f agent-studio-tei-embedding-1  # 看到 "Starting Bert model on Cu
 
 ### 4. 验证
 
+> ⚠️ **当前状态**：编译验证中（CUDA 12.6 toolkit 绑定编译方案）。以下为预期输出，
+> 实际验收结果将在编译完成后通过 `verify-tei.sh all` 填入。
+
 ```bash
 bash verify-tei.sh all
 ```
 
-预期输出：
+#### 阶段 1：编译验收
+
+| 检查项 | 预期 | 状态 |
+| --- | --- | --- |
+| 镜像 `tei:jetson-runtime` 存在 | <500MB | ⏳ 待验证 |
+| 二进制为 ARM64 ELF | `ELF 64-bit ARM aarch64` | ⏳ 待验证 |
+| compute_cap sm_87 修复 | 二进制含 `80..=89` 分支 | ⏳ 待验证 |
+| 宿主 cuBLAS | `cublasCreate: 0` | ✅ 已验证 |
+
+#### 阶段 2：安装调试验收
+
+| 检查项 | 预期 | 状态 |
+| --- | --- | --- |
+| 两容器启动 + healthy | `docker ps` 可见 | ⏳ 待验证 |
+| GPU 推理（非 CPU fallback） | 日志含 `Starting Bert model on Cuda(0)` | ⏳ 待验证 |
+| `/health` 返回 ready | `{"status":"ready"}` | ⏳ 待验证 |
+| GPU 利用率（tegrastats） | embed 调用时 `GR3D_FREQ > 0%` | ⏳ 待验证 |
+
+#### 阶段 3：功能验收
+
+| 检查项 | 预期 | 状态 |
+| --- | --- | --- |
+| Embedding 维度 | 1024 维 | ⏳ 待验证 |
+| Embedding 延迟 | <50ms（vs SaaS 80-150ms） | ⏳ 待验证 |
+| Rerank 排序正确性 | 按相关性排序 | ⏳ 待验证 |
+| Rerank 延迟 | <100ms | ⏳ 待验证 |
+
+预期输出格式：
 ```
 ✓ 镜像 tei:jetson-runtime 存在
 ✓ 二进制为 ARM64 ELF
@@ -202,7 +272,7 @@ bash verify-tei.sh all
 ✓ embedding 使用 GPU（日志含 Cuda）
 ✓ embedding /health 返回 ready
 ✓ embedding 返回 1024 维向量
-✓ embedding 平均延迟: 12.3ms
+✓ embedding 平均延迟: XX.Xms
 ✓ rerank 返回 3 个结果（含 score）
 ═══════════════════════════════════════════════════════════════
   结果: 10 通过 / 0 失败

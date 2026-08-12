@@ -17,9 +17,49 @@
 - [Build Time Analysis](#build-time-analysis)
 - [Files](#files)
 - [Runtime Configuration](#runtime-configuration)
+- [Use Cases](#use-cases)
 - [Known Limitations](#known-limitations)
 - [FAQ](#faq)
 - [License](#license)
+
+## Use Cases
+
+### When Do You Need TEI
+
+Any application requiring **text embedding or reranking**:
+
+| Scenario | Embedding | Reranker |
+| --- | --- | --- |
+| **RAG / Knowledge Base QA** | Vectorize document chunks for vector DB | Re-rank retrieved results by relevance |
+| **Semantic Search** | Vectorize queries, compare with documents | Re-rank top-N for precision |
+| **Dedup / Clustering** | Compute document similarity | — |
+| **Recommendation** | User/item embeddings | Re-rank candidate lists |
+| **Multilingual Retrieval** | Cross-lingual semantic matching (BGE-m3: 100+ languages) | Cross-lingual relevance scoring |
+
+### Why Local Instead of SaaS API
+
+| Factor | SaaS API (SiliconFlow/OpenAI/Jina) | Local TEI |
+| --- | --- | --- |
+| **Latency** | 80-150ms (public network RTT) | **5-30ms** (local) |
+| **Privacy** | Text sent to third-party servers | **Data never leaves your machine** |
+| **Cost** | Per-call pricing ($0.01-0.1/1K calls) | **Zero marginal cost** |
+| **Offline** | Not available | **Fully offline** |
+| **Concurrency** | API rate limits | Only limited by GPU |
+
+### Why Jetson
+
+| Hardware | Verdict |
+| --- | --- |
+| **Jetson Orin ✅** | ARM64 + GPU + low power (15-60W); ideal for edge/private deployment; reuse existing Jetson hardware |
+| Server GPU (A100/H100) | Best performance but $10K+, 300W+, not suitable for edge |
+| Mac mini | Docker doesn't support Metal GPU passthrough; good for personal LLM but not containerized services |
+| DGX Spark | Official TEI pre-built image, easiest path; but $3,999 additional cost |
+
+**Typical deployment**: Jetson Orin NX 16GB as an inference node for AI applications,
+reducing embedding/reranker latency from 80-150ms (SaaS) to 5-30ms (local),
+with all text processing staying on-device — ideal for privacy-sensitive knowledge base scenarios.
+
+---
 
 ## Why This Project
 
@@ -190,11 +230,41 @@ docker logs -f agent-studio-tei-embedding-1  # Look for "Starting Bert model on 
 
 ### Verify
 
+> ⚠️ **Current Status**: Compilation in progress (CUDA 12.6 toolkit bind-mount approach).
+> The following are expected results — actual verification will be filled in after compilation completes.
+
 ```bash
 bash verify-tei.sh all
 ```
 
-Expected output:
+#### Stage 1: Compilation Verification
+
+| Check | Expected | Status |
+| --- | --- | --- |
+| Image `tei:jetson-runtime` exists | <500MB | ⏳ Pending |
+| Binary is ARM64 ELF | `ELF 64-bit ARM aarch64` | ⏳ Pending |
+| compute_cap sm_87 fix included | Binary contains `80..=89` branch | ⏳ Pending |
+| Host cuBLAS works | `cublasCreate: 0` | ✅ Verified |
+
+#### Stage 2: Installation Verification
+
+| Check | Expected | Status |
+| --- | --- | --- |
+| Both containers up + healthy | `docker ps` shows both | ⏳ Pending |
+| GPU inference (not CPU fallback) | Logs show `Starting Bert model on Cuda(0)` | ⏳ Pending |
+| `/health` returns ready | `{"status":"ready"}` | ⏳ Pending |
+| GPU utilization (tegrastats) | `GR3D_FREQ > 0%` during embed call | ⏳ Pending |
+
+#### Stage 3: Functional Verification
+
+| Check | Expected | Status |
+| --- | --- | --- |
+| Embedding dimension | 1024-dim | ⏳ Pending |
+| Embedding latency | <50ms (vs SaaS 80-150ms) | ⏳ Pending |
+| Rerank correctness | Sorted by relevance | ⏳ Pending |
+| Rerank latency | <100ms | ⏳ Pending |
+
+Expected output format:
 ```
 ✓ Image tei:jetson-runtime exists
 ✓ Binary is ARM64 ELF
@@ -203,7 +273,7 @@ Expected output:
 ✓ embedding using GPU (logs contain Cuda)
 ✓ embedding /health returns ready
 ✓ embedding returns 1024-dim vector
-✓ embedding average latency: 12.3ms
+✓ embedding average latency: XX.Xms
 ✓ rerank returns 3 results (with score)
 ═══════════════════════════════════════════════════════════════
   Result: 10 passed / 0 failed
