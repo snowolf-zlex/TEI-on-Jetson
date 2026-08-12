@@ -9,10 +9,11 @@
 
 - [为什么需要这个项目](#为什么需要这个项目)
 - [兼容性](#兼容性)
-- [方案演进（8 轮踩坑记录）](#方案演进8-轮踩坑记录)
+- [方案演进（10 轮踩坑记录）](#方案演进10-轮踩坑记录)
 - [快速开始](#快速开始)
   - [选项 A：下载预编译二进制（推荐）](#选项-a下载预编译二进制推荐1-分钟)
   - [选项 B：自己编译](#选项-b自己编译可定制5-9-小时)
+- [验收](#验收)
 - [编译耗时实测](#编译耗时实测)
 - [使用场景](#使用场景)
 - [文件说明](#文件说明)
@@ -125,7 +126,7 @@ HuggingFace TEI 官方只发布 **x86 CUDA** 预编译镜像。Jetson 是 **ARM6
 
 ---
 
-## 方案演进（8 轮踩坑记录）
+## 方案演进（10 轮踩坑记录）
 
 | # | 方案 | 结果 | 根因 |
 | --- | --- | --- | --- |
@@ -156,20 +157,16 @@ HuggingFace TEI 官方只发布 **x86 CUDA** 预编译镜像。Jetson 是 **ARM6
 | 容器 cuBLAS 初始化 | ✅ `cublasCreate: 0` | 容器 + bind mount 宿主 CUDA 库 |
 | 容器 cuBLAS Sgemm | ✅ 结果正确 | 动态链接 `libcublas.so.12.6` |
 | **TEI GPU 检测** | ✅ `Cuda(CudaDevice(DeviceId(1)))` | TEI 二进制（dynamic-linking）在容器中 |
-| **TEI cuBLAS 初始化** | ✅ 无 `CUBLAS_STATUS_ALLOC_FAILED` | TEI 启动成功，开始加载模型 |
+| **TEI cuBLAS 初始化** | ✅ 无 `CUBLAS_STATUS_ALLOC_FAILED` | TEI 启动成功，两个模型均可加载 |
+| **TEI 端到端推理** | ✅ 20/20 验收通过 | GPU 上执行 `/embed` + `/rerank` |
 
-**阻塞中：**
+**PTX 问题解决状态：**
 
-| 测试 | 错误 | 根因 |
+| 检查 | 结果 | 方式 |
 | --- | --- | --- |
-| TEI kernel 加载 | ❌ `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | nvcc 生成的 PTX 与 Jetson 12.6 driver 不兼容 |
-
-**PTX 问题详情**：编译容器的 nvcc（来自 `nvidia/cuda:12.9.1-devel`）生成的 PTX 被 Jetson 12.6 driver
-拒绝。即使 bind mount 了宿主 CUDA 12.6 到 `/usr/local/cuda`，容器内仍有 `/usr/local/cuda-12.9/`
-内部组件，nvcc 可能混用了 12.6 和 12.9 的文件。
-
-**下一步**：用 `CUDA_COMPUTE_CAP=80` 重新编译（compute_80 PTX 兼容所有 Ampere），
-或确保 nvcc 只使用宿主 12.6 组件，排除 12.9 污染。
+| CUDA 12.9 遗留 PTX 缓存 | ✅ 最终编译前清理 | `build-tei-jetson.sh` 隔离 Candle CUDA output、fingerprint 和 rlib |
+| Candle `cast.ptx` 版本 | ✅ `.version 8.5` | 不是 CUDA 12.6 PTX 时构建 fail closed |
+| TEI kernel 加载 | ✅ 无 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | 最终运行时验收 |
 
 ---
 
@@ -248,14 +245,8 @@ docker build --target builder --platform linux/arm64 \
   --build-arg RAYON_NUM_THREADS=1 \
   -t tei:builder .
 
-# 步骤 B：bind mount 宿主 CUDA 12.6 toolkit 做最终编译（50 分钟 ~ 5 小时）
-docker run -d --name tei-build --runtime runc \
-  -e CUDA_COMPUTE_CAP=87 \
-  -e CARGO_BUILD_JOBS=3 \
-  -v /usr/local/cuda:/usr/local/cuda:ro \
-  tei:builder \
-  bash -c 'cd /usr/src && cargo build --release --bin text-embeddings-router \
-    -F candle-cuda -F dynamic-linking -F http --no-default-features && echo BUILD_OK'
+# 步骤 B：用硬 CPU/内存限制执行 dynamic-linking 最终编译
+TEI_BUILD_CONTAINER=tei-build bash build-tei-jetson.sh
 
 # 等待编译完成
 docker logs -f tei-build   # 看到 BUILD_OK 或 Finished
@@ -277,58 +268,61 @@ cp docker-compose.tei.yml docker-compose.override.yml
 # 启动 TEI 服务
 docker compose up -d tei-embedding tei-reranker
 # 等待模型加载（约 30 秒）
-docker logs -f agent-studio-tei-embedding-1  # 看到 "Starting Bert model on Cuda(0)"
+docker logs -f agent-studio-tei-embedding-1  # 看到 "Starting ... on Cuda(...)"
 ```
 
-### 4. 验证
+## 验收
 
-> ⚠️ **当前状态**：编译验证中（CUDA 12.6 toolkit 绑定编译方案）。以下为预期输出，
-> 实际验收结果将在编译完成后通过 `verify-tei.sh all` 填入。
+> ✅ **已验证**：2026-08-12，Jetson Orin NX 16GB，JetPack 6.2.3，CUDA 12.6。**20/20 通过。**
 
 ```bash
 bash verify-tei.sh all
 ```
 
+完整验收方法、固定测试输入、实测结果和兼容性说明见
+[docs/validation.zh-CN.md](docs/validation.zh-CN.md)。
+
 #### 阶段 1：编译验收
 
-| 检查项 | 预期 | 状态 |
+| 检查项 | 预期 | 结果 |
 | --- | --- | --- |
-| 镜像 `tei:jetson-runtime` 存在 | <500MB | ⏳ 待验证 |
-| 二进制为 ARM64 ELF | `ELF 64-bit ARM aarch64` | ⏳ 待验证 |
-| compute_cap sm_87 修复 | 二进制含 `80..=89` 分支 | ⏳ 待验证 |
-| 宿主 cuBLAS | `cublasCreate: 0` | ✅ 已验证 |
+| 镜像 `tei:jetson-runtime` 存在 | <500MB | ✅ 161MB |
+| 二进制为 ARM64 ELF | `ELF 64-bit ARM aarch64` | ✅ |
+| compute_cap sm_87 修复 | 二进制含 `80..=89` 分支 | ✅ |
+| 宿主 cuBLAS | `cublasCreate: 0` | ✅ |
 
 #### 阶段 2：安装调试验收
 
-| 检查项 | 预期 | 状态 |
+| 检查项 | 预期 | 结果 |
 | --- | --- | --- |
-| 两容器启动 + healthy | `docker ps` 可见 | ⏳ 待验证 |
-| GPU 推理（非 CPU fallback） | 日志含 `Starting Bert model on Cuda(0)` | ⏳ 待验证 |
-| `/health` 返回 ready | `{"status":"ready"}` | ⏳ 待验证 |
-| GPU 利用率（tegrastats） | embed 调用时 `GR3D_FREQ > 0%` | ⏳ 待验证 |
+| 两容器启动 + healthy | `docker ps` 可见 | ✅ |
+| GPU 推理（非 CPU fallback） | 日志含 `Starting.*Cuda` | ✅ |
+| `/health` 返回 HTTP 200 | TEI 1.9.3 body 为空 | ✅ |
+| GPU 利用率（tegrastats） | embed 调用时 `GR3D_FREQ > 0%` | ✅ |
 
 #### 阶段 3：功能验收
 
-| 检查项 | 预期 | 状态 |
+| 检查项 | 预期 | 结果 |
 | --- | --- | --- |
-| Embedding 维度 | 1024 维 | ⏳ 待验证 |
-| Embedding 延迟 | <50ms（vs SaaS 80-150ms） | ⏳ 待验证 |
-| Rerank 排序正确性 | 按相关性排序 | ⏳ 待验证 |
-| Rerank 延迟 | <100ms | ⏳ 待验证 |
+| Embedding 维度 | 1024 维 | ✅ 1024 |
+| Embedding 延迟 | <50ms（vs SaaS 80-150ms） | ✅ **13.7ms** |
+| Rerank 排序正确性 | 按相关性排序 | ✅ |
+| Rerank 延迟 | <100ms | ✅ **22.5ms** |
 
-预期输出格式：
+实测输出摘要：
 ```
-✓ 镜像 tei:jetson-runtime 存在
+✓ 镜像 tei:jetson-runtime 存在（161MB）
 ✓ 二进制为 ARM64 ELF
 ✓ compute_cap sm_87 修复已包含
 ✓ tei-embedding 容器运行中
 ✓ embedding 使用 GPU（日志含 Cuda）
-✓ embedding /health 返回 ready
+✓ embedding /health 返回 HTTP 200
 ✓ embedding 返回 1024 维向量
-✓ embedding 平均延迟: XX.Xms
+✓ embedding 平均延迟: 13.7ms
 ✓ rerank 返回 3 个结果（含 score）
+✓ rerank 平均延迟: 22.5ms
 ═══════════════════════════════════════════════════════════════
-  结果: 10 通过 / 0 失败
+  结果: 20 通过 / 0 失败
 ═══════════════════════════════════════════════════════════════
 ```
 
@@ -363,7 +357,8 @@ bash verify-tei.sh all
 | hdim224 | 4 | 22-28 分钟 |
 | hdim256 | 4 | 28-40 分钟 |
 
-JOBS=3 并行时约 3-4 小时（每个 cicc 进程 ~4GB，3 并行需 ~12GB 内存）。
+历史 JOBS=3 并行构建约 3-4 小时，但这不是安全基线：单个 build script 仍可能启动多个
+`nvcc`/`cicc`。请使用 `build-tei-jetson.sh`，通过 Docker cgroup 给宿主系统保留 CPU 和内存。
 
 ### 为什么 JOBS=2 会 OOM 死机
 
@@ -378,7 +373,9 @@ JOBS=3 并行时约 3-4 小时（每个 cicc 进程 ~4GB，3 并行需 ~12GB 内
   总计 .......................... ~17GB > 16GB → swap 风暴 → 死机
 ```
 
-**必须用 `CARGO_BUILD_JOBS=1` + `RAYON_NUM_THREADS=1`，或 `JOBS=3`（需 ≥16GB）。**
+**必须使用 `build-tei-jetson.sh`**。它同时设置 Docker `--cpus=4 --memory=10g`、
+`CARGO_BUILD_JOBS=1`、`RAYON_NUM_THREADS=1`、`CMAKE_BUILD_PARALLEL_LEVEL=1` 和
+`NVCC_THREADS=1`。
 
 ---
 
@@ -388,7 +385,7 @@ JOBS=3 并行时约 3-4 小时（每个 cicc 进程 ~4GB，3 并行需 ~12GB 内
 | --- | --- |
 | `Dockerfile.tei-builder` | 编译用（Rust 工具链 + nvcc + USTC 镜像 + compute_cap 修复） |
 | `Dockerfile.tei-runtime` | 精简运行时镜像（~200MB，不含编译工具链） |
-| `docker-compose.tei.yml` | 服务编排（CUDA 库挂载 + nvhost 设备 + compat 隐藏） |
+| `docker-compose.tei.yml` | 服务编排（CUDA 库挂载 + nvhost 设备） |
 | `compute_cap-sm87-fix.patch` | candle `compute_cap_matching(87,87)` bug 修复 |
 | `verify-tei.sh` | 三阶段验收脚本（编译 → 安装 → 功能） |
 
@@ -400,11 +397,10 @@ JOBS=3 并行时约 3-4 小时（每个 cicc 进程 ~4GB，3 并行需 ~12GB 内
 
 | 配置 | 原因 |
 | --- | --- |
-| bind mount `/usr/local/cuda/lib64` | 用宿主 CUDA 12.6 库覆盖镜像的 12.9 |
+| bind mount `/usr/local/cuda/lib64` | 提供宿主 CUDA 12.6 runtime/cuBLAS 动态库 |
 | bind mount `/usr/lib/aarch64-linux-gnu/tegra` | Tegra GPU driver 库（`libcuda.so` 的 Jetson 实现） |
 | `devices: /dev/nvhost-*` | Jetson GPU 设备节点（CUDA 内存分配需要 nvhost 接口） |
-| bind mount `/tmp → /usr/local/cuda/compat` | 隐藏 CUDA 12.9 compat driver，防止覆盖 Tegra driver |
-| `NVIDIA_DISABLE_REQUIRE=true` | 跳过 nvidia-container-runtime 的 CUDA 版本检查 |
+| 直接 router entrypoint | 绕过 CUDA 12.9 compat wrapper，使用 Jetson 宿主库 |
 
 ---
 
@@ -412,7 +408,7 @@ JOBS=3 并行时约 3-4 小时（每个 cicc 进程 ~4GB，3 并行需 ~12GB 内
 
 1. **编译成本极高**：首次 5-9 小时，candle-flash-attn 的 33 个 CUDA kernel 占 67%
 2. **无增量编译**：bindgen_cuda 每次全量重编译 CUDA kernel，改一行代码 → 4-7 小时
-3. **JetPack 版本绑定**：cuBLAS 静态链接版本必须与 driver 匹配
+3. **JetPack 版本绑定**：dynamic binary 依赖 CUDA 12 `libcublas.so.12`；CUDA 13 / JetPack 7 需重新编译和验收
 4. **仅 Orin sm_87 + JetPack 6.x**：Xavier/TX2/Nano 和 JP5/JP4 不支持
 5. **Flash Attention 收益有限**：33 个 kernel 的编译开销巨大，但 embedding/reranker 的短序列推理收益很小
 
@@ -452,7 +448,7 @@ TEI 专门优化 embedding/reranker，支持 OpenAI/Jina 兼容 API。
 | --- | --- | --- | --- | --- | --- |
 | `text-embeddings-router-sm87-cuda126` | aarch64 | 12.6 | sm_87 | 1.9.3 (main) | ~1.1GB |
 
-二进制包含 cuBLAS 12.6 静态链接 + compute_cap sm_87 修复 + candle-flash-attn（33 个 CUDA kernel）。
+二进制动态加载宿主 cuBLAS/cuBLASLt，并包含 compute_cap sm_87 修复和 candle-flash-attn kernels。
 不包含模型文件（需单独下载）。
 
 ---

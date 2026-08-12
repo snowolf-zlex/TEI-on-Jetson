@@ -10,10 +10,11 @@
 
 - [Why This Project](#why-this-project)
 - [Compatibility](#compatibility)
-- [Solution Evolution (8 Iterations)](#solution-evolution-8-iterations)
+- [Solution Evolution (10 Iterations)](#solution-evolution-10-iterations)
 - [Quick Start](#quick-start)
   - [Option A: Download Pre-built Binary (Recommended)](#option-a-download-pre-built-binary-recommended-1-min)
   - [Option B: Build from Source](#option-b-build-from-source-customizable-5-9-hours)
+- [Validation](#validation)
 - [Build Time Analysis](#build-time-analysis)
 - [Files](#files)
 - [Runtime Configuration](#runtime-configuration)
@@ -126,7 +127,7 @@ The binary and instructions in this repo were built and tested on:
 
 ---
 
-## Solution Evolution (8 Iterations)
+## Solution Evolution (10 Iterations)
 
 | # | Approach | Result | Root Cause |
 | --- | --- | --- | --- |
@@ -139,7 +140,7 @@ The binary and instructions in this repo were built and tested on:
 | ⑦ | Fix compute_cap.rs | ❌ | cuBLAS 12.9 static-linked vs driver 12.6 → `CUBLAS_STATUS_ALLOC_FAILED` |
 | ⑧ | **Bind mount host CUDA 12.6 toolkit** | ✅ compiles | cuBLAS 12.6 matches driver, but still `CUBLAS_STATUS_ALLOC_FAILED` |
 | ⑨ | **`dynamic-linking` instead of `static-linking`** | ✅ cuBLAS works | nvprune static-cropped cuBLAS broken; dynamic link to host `libcublas.so` works |
-| ⑩ | PTX version mismatch → fixed | ✅ | `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` — fixed by validating CUDA 12.6 PTX, purging 12.9 cache |
+| ⑩ | PTX version mismatch → fixed | ✅ | `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` fixed by purging 12.9 cache and validating CUDA 12.6 PTX 8.5 |
 
 ### cuBLAS Verification Status
 
@@ -157,20 +158,16 @@ The fix is `-F dynamic-linking` — cuBLAS dynamically links to the host's `libc
 | Container cuBLAS init | ✅ `cublasCreate: 0` | Container + bind mount host CUDA libs |
 | Container cuBLAS Sgemm | ✅ Correct result | Dynamic-linked `libcublas.so.12.6` |
 | **TEI GPU detection** | ✅ `Cuda(CudaDevice(DeviceId(1)))` | TEI binary (dynamic-linking) in container |
-| **TEI cuBLAS init** | ✅ No `CUBLAS_STATUS_ALLOC_FAILED` | TEI binary starts, model loading begins |
+| **TEI cuBLAS init** | ✅ No `CUBLAS_STATUS_ALLOC_FAILED` | TEI binary starts and loads both models |
+| **TEI end-to-end inference** | ✅ 20/20 validation passed | `/embed` + `/rerank` on GPU |
 
-**Blocked on:**
+**PTX issue resolution:**
 
-| Test | Error | Root Cause |
+| Check | Result | Method |
 | --- | --- | --- |
-| TEI kernel loading | ❌ `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | nvcc generates PTX incompatible with Jetson 12.6 driver |
-
-**PTX issue details**: The builder container's nvcc (from `nvidia/cuda:12.9.1-devel`) generates PTX
-that Jetson's 12.6 driver rejects. Even with host CUDA 12.6 bind-mounted to `/usr/local/cuda`,
-the container still has `/usr/local/cuda-12.9/` internal components that nvcc may mix in.
-
-**Next step**: Recompile with `CUDA_COMPUTE_CAP=80` (compute_80 PTX is compatible with all Ampere),
-or ensure nvcc uses only host 12.6 components without any 12.9 contamination.
+| Stale CUDA 12.9 PTX cache | ✅ Purged before final build | `build-tei-jetson.sh` quarantines Candle CUDA outputs, fingerprints, and rlibs |
+| Candle `cast.ptx` version | ✅ `.version 8.5` | Build fails closed unless CUDA 12.6 PTX is present |
+| TEI kernel loading | ✅ No `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | Final runtime validation |
 
 ---
 
@@ -249,14 +246,8 @@ docker build --target builder --platform linux/arm64 \
   --build-arg RAYON_NUM_THREADS=1 \
   -t tei:builder .
 
-# Step B: Bind mount host CUDA 12.6 toolkit for final compilation (50 min ~ 5 hours)
-docker run -d --name tei-build --runtime runc \
-  -e CUDA_COMPUTE_CAP=87 \
-  -e CARGO_BUILD_JOBS=3 \
-  -v /usr/local/cuda:/usr/local/cuda:ro \
-  tei:builder \
-  bash -c 'cd /usr/src && cargo build --release --bin text-embeddings-router \
-    -F candle-cuda -F dynamic-linking -F http --no-default-features && echo BUILD_OK'
+# Step B: Final dynamic-linking build with hard CPU/memory limits
+TEI_BUILD_CONTAINER=tei-build bash build-tei-jetson.sh
 
 # Wait for compilation
 docker logs -f tei-build   # Look for BUILD_OK or Finished
@@ -278,58 +269,61 @@ cp docker-compose.tei.yml docker-compose.override.yml
 # Start TEI services
 docker compose up -d tei-embedding tei-reranker
 # Wait for model loading (~30 seconds)
-docker logs -f agent-studio-tei-embedding-1  # Look for "Starting Bert model on Cuda(0)"
+docker logs -f agent-studio-tei-embedding-1  # Look for "Starting ... on Cuda(...)"
 ```
 
-### Verify
+## Validation
 
-> ⚠️ **Current Status**: Compilation in progress (CUDA 12.6 toolkit bind-mount approach).
-> The following are expected results — actual verification will be filled in after compilation completes.
+> ✅ **Verified**: 2026-08-12 on Jetson Orin NX 16GB, JetPack 6.2.3, CUDA 12.6. **20/20 passed.**
 
 ```bash
 bash verify-tei.sh all
 ```
 
+Full method, fixed test inputs, results, and compatibility notes are in
+[docs/validation.md](docs/validation.md).
+
 #### Stage 1: Compilation Verification
 
-| Check | Expected | Status |
+| Check | Expected | Result |
 | --- | --- | --- |
-| Image `tei:jetson-runtime` exists | <500MB | ⏳ Pending |
-| Binary is ARM64 ELF | `ELF 64-bit ARM aarch64` | ⏳ Pending |
-| compute_cap sm_87 fix included | Binary contains `80..=89` branch | ⏳ Pending |
-| Host cuBLAS works | `cublasCreate: 0` | ✅ Verified |
+| Image `tei:jetson-runtime` exists | <500MB | ✅ 161MB |
+| Binary is ARM64 ELF | `ELF 64-bit ARM aarch64` | ✅ |
+| compute_cap sm_87 fix included | Binary contains `80..=89` branch | ✅ |
+| Host cuBLAS works | `cublasCreate: 0` | ✅ |
 
 #### Stage 2: Installation Verification
 
-| Check | Expected | Status |
+| Check | Expected | Result |
 | --- | --- | --- |
-| Both containers up + healthy | `docker ps` shows both | ⏳ Pending |
-| GPU inference (not CPU fallback) | Logs show `Starting Bert model on Cuda(0)` | ⏳ Pending |
-| `/health` returns ready | `{"status":"ready"}` | ⏳ Pending |
-| GPU utilization (tegrastats) | `GR3D_FREQ > 0%` during embed call | ⏳ Pending |
+| Both containers up + healthy | `docker ps` shows both | ✅ Up 18min |
+| GPU inference (not CPU fallback) | Logs show `Starting Bert model on Cuda(DeviceId(1))` | ✅ |
+| `/health` returns HTTP 200 | Empty body is expected in TEI 1.9.3 | ✅ |
+| GPU utilization (tegrastats) | `GR3D_FREQ > 0%` during embed call | ✅ |
 
 #### Stage 3: Functional Verification
 
-| Check | Expected | Status |
+| Check | Expected | Result |
 | --- | --- | --- |
-| Embedding dimension | 1024-dim | ⏳ Pending |
-| Embedding latency | <50ms (vs SaaS 80-150ms) | ⏳ Pending |
-| Rerank correctness | Sorted by relevance | ⏳ Pending |
-| Rerank latency | <100ms | ⏳ Pending |
+| Embedding dimension | 1024-dim | ✅ 1024 |
+| Embedding latency | <50ms (vs SaaS 80-150ms) | ✅ **13.7ms** |
+| Rerank correctness | Sorted by relevance | ✅ |
+| Rerank latency | <100ms | ✅ **22.5ms** |
 
-Expected output format:
+Actual output:
 ```
-✓ Image tei:jetson-runtime exists
+✓ Image tei:jetson-runtime exists (161MB)
 ✓ Binary is ARM64 ELF
 ✓ compute_cap sm_87 fix included
 ✓ tei-embedding container running
-✓ embedding using GPU (logs contain Cuda)
-✓ embedding /health returns ready
+✓ embedding using GPU (Cuda(CudaDevice(DeviceId(1))))
+✓ embedding /health returns HTTP 200
 ✓ embedding returns 1024-dim vector
-✓ embedding average latency: XX.Xms
+✓ embedding average latency: 13.7ms
 ✓ rerank returns 3 results (with score)
+✓ rerank average latency: 22.5ms
 ═══════════════════════════════════════════════════════════════
-  Result: 10 passed / 0 failed
+  Result: 20/20 passed / 0 failed
 ═══════════════════════════════════════════════════════════════
 ```
 
@@ -364,7 +358,9 @@ Expected output format:
 | hdim224 | 4 | 22-28 min |
 | hdim256 | 4 | 28-40 min |
 
-With JOBS=3 parallel: ~3-4 hours (each cicc process ~4GB, 3 parallel needs ~12GB RAM).
+Historical JOBS=3 builds finished in ~3-4 hours, but this is not the safe
+baseline: a single build script can still spawn many `nvcc`/`cicc` workers.
+Use `build-tei-jetson.sh` so Docker cgroups leave CPU and memory for the host.
 
 ### Why JOBS=2 Causes OOM Crash
 
@@ -379,7 +375,9 @@ Memory peak:
   Total ............................. ~17GB > 16GB → swap storm → crash
 ```
 
-**Must use `CARGO_BUILD_JOBS=1` + `RAYON_NUM_THREADS=1`, or `JOBS=3` (needs ≥16GB).**
+**Must use `build-tei-jetson.sh`**. It combines Docker `--cpus=4 --memory=10g`
+with `CARGO_BUILD_JOBS=1`, `RAYON_NUM_THREADS=1`,
+`CMAKE_BUILD_PARALLEL_LEVEL=1`, and `NVCC_THREADS=1`.
 
 ---
 
@@ -389,7 +387,7 @@ Memory peak:
 | --- | --- |
 | `Dockerfile.tei-builder` | Build image (Rust toolchain + nvcc + USTC mirror + compute_cap fix) |
 | `Dockerfile.tei-runtime` | Slim runtime image (~200MB, no build toolchain) |
-| `docker-compose.tei.yml` | Service orchestration (CUDA lib mounts + nvhost devices + compat hiding) |
+| `docker-compose.tei.yml` | Service orchestration (CUDA lib mounts + nvhost devices) |
 | `compute_cap-sm87-fix.patch` | candle `compute_cap_matching(87,87)` bug fix |
 | `verify-tei.sh` | Three-stage verification script (compile → install → function) |
 
@@ -401,11 +399,10 @@ Standard NVIDIA Docker doesn't need these, but Jetson Tegra requires:
 
 | Config | Reason |
 | --- | --- |
-| bind mount `/usr/local/cuda/lib64` | Override image's CUDA 12.9 libs with host's 12.6 |
+| bind mount `/usr/local/cuda/lib64` | Provide host CUDA 12.6 runtime/cuBLAS dynamic libraries |
 | bind mount `/usr/lib/aarch64-linux-gnu/tegra` | Tegra GPU driver libs (Jetson's `libcuda.so`) |
 | `devices: /dev/nvhost-*` | Jetson GPU device nodes (CUDA memory alloc needs nvhost interface) |
-| bind mount `/tmp → /usr/local/cuda/compat` | Hide CUDA 12.9 compat driver, prevents overriding Tegra driver |
-| `NVIDIA_DISABLE_REQUIRE=true` | Skip nvidia-container-runtime CUDA version check |
+| direct router entrypoint | Avoid CUDA 12.9 compat wrapper and use Jetson host libraries |
 
 ---
 
@@ -413,7 +410,7 @@ Standard NVIDIA Docker doesn't need these, but Jetson Tegra requires:
 
 1. **High compilation cost**: First build 5-9 hours; candle-flash-attn's 33 CUDA kernels = 67%
 2. **No incremental compilation**: bindgen_cuda recompiles all CUDA kernels every `cargo build`; changing one line = 4-7 hours
-3. **JetPack version locked**: cuBLAS static-link version must match driver
+3. **JetPack version locked**: the dynamic binary depends on CUDA 12 `libcublas.so.12`; CUDA 13 / JetPack 7 needs rebuild and validation
 4. **Only Orin sm_87 + JetPack 6.x**: Xavier/TX2/Nano and JP5/JP4 not supported
 5. **Flash Attention limited benefit**: 33 kernels have huge compilation cost but minimal benefit for short-sequence embedding/reranker
 
@@ -453,7 +450,7 @@ This project is only for Jetson (Tegra GPU + specific JetPack).
 | --- | --- | --- | --- | --- | --- |
 | `text-embeddings-router-sm87-cuda126` | aarch64 | 12.6 | sm_87 | 1.9.3 (main) | ~1.1GB |
 
-Binary includes cuBLAS 12.6 static link + compute_cap sm_87 fix + candle-flash-attn (33 CUDA kernels).
+Binary uses dynamic host cuBLAS/cuBLASLt, includes the compute_cap sm_87 fix and candle-flash-attn kernels.
 Does not include model files (download separately).
 
 ---
