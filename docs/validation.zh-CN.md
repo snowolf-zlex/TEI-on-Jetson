@@ -25,7 +25,7 @@
 先启动两个 TEI 服务：
 
 ```bash
-docker compose up -d tei-embedding tei-reranker
+docker compose -f docker/docker-compose.tei.yml up -d tei-embedding tei-reranker
 ```
 
 再执行三阶段验收：

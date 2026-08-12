@@ -267,10 +267,8 @@ docker build -f docker/Dockerfile.tei-runtime -t tei:jetson-runtime .
 ### 部署
 
 ```bash
-# 复制 compose 模板
-cp docker/docker-compose.tei.yml docker-compose.override.yml
 # 启动 TEI 服务
-docker compose up -d tei-embedding tei-reranker
+docker compose -f docker/docker-compose.tei.yml up -d tei-embedding tei-reranker
 # 等待模型加载（约 30 秒）
 docker logs -f agent-studio-tei-embedding-1  # 看到 "Starting ... on Cuda(...)"
 ```

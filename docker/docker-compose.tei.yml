@@ -1,8 +1,8 @@
 # =============================================================================
 # docker/docker-compose.tei.yml — Jetson Orin TEI 服务模板
 # =============================================================================
-# 用法：在 Jetson 上复制为 docker-compose.override.yml（受保护，不入 Git）
-#   cp docker/docker-compose.tei.yml docker-compose.override.yml
+# 用法：在 Jetson 上从仓库根目录执行
+#   docker compose -f docker/docker-compose.tei.yml up -d tei-embedding tei-reranker
 #
 # 前提：
 #   1. tei:jetson-runtime 镜像已构建（docker/Dockerfile.tei-runtime）

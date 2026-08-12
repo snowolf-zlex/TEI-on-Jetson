@@ -27,7 +27,7 @@ baseline uses TEI/cudarc `dynamic-linking` and bind-mounts Jetson host CUDA
 Start both TEI services first:
 
 ```bash
-docker compose up -d tei-embedding tei-reranker
+docker compose -f docker/docker-compose.tei.yml up -d tei-embedding tei-reranker
 ```
 
 Then run all three stages:
