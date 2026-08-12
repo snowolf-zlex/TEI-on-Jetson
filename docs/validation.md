@@ -33,15 +33,15 @@ docker compose up -d tei-embedding tei-reranker
 Then run all three stages:
 
 ```bash
-bash verify-tei.sh all
+bash scripts/verify-tei.sh all
 ```
 
 Run a single stage when debugging:
 
 ```bash
-bash verify-tei.sh 1   # build/runtime image checks
-bash verify-tei.sh 2   # container, health, GPU checks
-bash verify-tei.sh 3   # embedding/rerank API checks
+bash scripts/verify-tei.sh 1   # build/runtime image checks
+bash scripts/verify-tei.sh 2   # container, health, GPU checks
+bash scripts/verify-tei.sh 3   # embedding/rerank API checks
 ```
 
 The script returns exit code `0` only when all required checks pass.

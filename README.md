@@ -165,7 +165,7 @@ The fix is `-F dynamic-linking` — cuBLAS dynamically links to the host's `libc
 
 | Check | Result | Method |
 | --- | --- | --- |
-| Stale CUDA 12.9 PTX cache | ✅ Purged before final build | `build-tei-jetson.sh` quarantines Candle CUDA outputs, fingerprints, and rlibs |
+| Stale CUDA 12.9 PTX cache | ✅ Purged before final build | `scripts/build-tei-jetson.sh` quarantines Candle CUDA outputs, fingerprints, and rlibs |
 | Candle `cast.ptx` version | ✅ `.version 8.5` | Build fails closed unless CUDA 12.6 PTX is present |
 | TEI kernel loading | ✅ No `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | Final runtime validation |
 
@@ -216,7 +216,7 @@ curl -sL "https://raw.githubusercontent.com/huggingface/text-embeddings-inferenc
   -o cuda-entrypoint.sh && chmod +x cuda-entrypoint.sh
 
 # Build slim runtime image (~30 seconds)
-docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+docker build -f docker/Dockerfile.tei-runtime -t tei:jetson-runtime .
 ```
 
 > **Binary compatibility**: `text-embeddings-router-sm87-cuda126` works on
@@ -229,32 +229,36 @@ For scenarios requiring source modifications, disabling flash attention, or diff
 
 ```bash
 # Get TEI source (use codeload tarball, not git clone — git-lfs causes incomplete checkout)
-curl -sL "https://codeload.github.com/huggingface/text-embeddings-inference/tar.gz/refs/heads/main" | tar xz
-mv text-embeddings-inference-main tei-src && cd tei-src
+mkdir -p tei-src
+curl -sL "https://codeload.github.com/huggingface/text-embeddings-inference/tar.gz/refs/heads/main" \
+  | tar xz -C tei-src --strip-components=1
 
 # Get missing cuda-entrypoint.sh
 curl -sL "https://raw.githubusercontent.com/huggingface/text-embeddings-inference/main/cuda-entrypoint.sh" \
-  -o cuda-entrypoint.sh && chmod +x cuda-entrypoint.sh
+  -o tei-src/cuda-entrypoint.sh && chmod +x tei-src/cuda-entrypoint.sh
 
 # Apply compute_cap sm_87 fix
-patch -p1 < ../compute_cap-sm87-fix.patch
+patch -d tei-src -p1 < patches/compute_cap-sm87-fix.patch
 
 # Step A: Build builder image (cargo chef cook pre-compiles dependencies, 4-7 hours)
-docker build --target builder --platform linux/arm64 \
+docker build -f docker/Dockerfile.tei-builder \
+  --target builder \
+  --platform linux/arm64 \
   --build-arg CUDA_COMPUTE_CAP=87 \
   --build-arg CARGO_BUILD_JOBS=1 \
   --build-arg RAYON_NUM_THREADS=1 \
-  -t tei:builder .
+  -t tei:builder \
+  tei-src
 
 # Step B: Final dynamic-linking build with hard CPU/memory limits
-TEI_BUILD_CONTAINER=tei-build bash build-tei-jetson.sh
+TEI_BUILD_CONTAINER=tei-build bash scripts/build-tei-jetson.sh
 
 # Wait for compilation
 docker logs -f tei-build   # Look for BUILD_OK or Finished
 
 # Step C: Copy binary + build slim runtime image
 docker cp tei-build:/usr/src/target/release/text-embeddings-router .
-docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+docker build -f docker/Dockerfile.tei-runtime -t tei:jetson-runtime .
 ```
 
 > **Want to skip flash attention compilation (saves 6 hours)?**
@@ -265,7 +269,7 @@ docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
 
 ```bash
 # Copy compose template
-cp docker-compose.tei.yml docker-compose.override.yml
+cp docker/docker-compose.tei.yml docker-compose.override.yml
 # Start TEI services
 docker compose up -d tei-embedding tei-reranker
 # Wait for model loading (~30 seconds)
@@ -277,7 +281,7 @@ docker logs -f agent-studio-tei-embedding-1  # Look for "Starting ... on Cuda(..
 > ✅ **Verified**: 2026-08-12 on Jetson Orin NX 16GB, JetPack 6.2.3, CUDA 12.6. **20/20 passed.**
 
 ```bash
-bash verify-tei.sh all
+bash scripts/verify-tei.sh all
 ```
 
 Full method, fixed test inputs, results, and compatibility notes are in
@@ -360,7 +364,7 @@ Actual output:
 
 Historical JOBS=3 builds finished in ~3-4 hours, but this is not the safe
 baseline: a single build script can still spawn many `nvcc`/`cicc` workers.
-Use `build-tei-jetson.sh` so Docker cgroups leave CPU and memory for the host.
+Use `scripts/build-tei-jetson.sh` so Docker cgroups leave CPU and memory for the host.
 
 ### Why JOBS=2 Causes OOM Crash
 
@@ -375,7 +379,7 @@ Memory peak:
   Total ............................. ~17GB > 16GB → swap storm → crash
 ```
 
-**Must use `build-tei-jetson.sh`**. It combines Docker `--cpus=4 --memory=10g`
+**Must use `scripts/build-tei-jetson.sh`**. It combines Docker `--cpus=4 --memory=10g`
 with `CARGO_BUILD_JOBS=1`, `RAYON_NUM_THREADS=1`,
 `CMAKE_BUILD_PARALLEL_LEVEL=1`, and `NVCC_THREADS=1`.
 
@@ -385,11 +389,11 @@ with `CARGO_BUILD_JOBS=1`, `RAYON_NUM_THREADS=1`,
 
 | File | Purpose |
 | --- | --- |
-| `Dockerfile.tei-builder` | Build image (Rust toolchain + nvcc + USTC mirror + compute_cap fix) |
-| `Dockerfile.tei-runtime` | Slim runtime image (~200MB, no build toolchain) |
-| `docker-compose.tei.yml` | Service orchestration (CUDA lib mounts + nvhost devices) |
-| `compute_cap-sm87-fix.patch` | candle `compute_cap_matching(87,87)` bug fix |
-| `verify-tei.sh` | Three-stage verification script (compile → install → function) |
+| `docker/Dockerfile.tei-builder` | Build image (Rust toolchain + nvcc + USTC mirror + compute_cap fix) |
+| `docker/Dockerfile.tei-runtime` | Slim runtime image (~200MB, no build toolchain) |
+| `docker/docker-compose.tei.yml` | Service orchestration (CUDA lib mounts + nvhost devices) |
+| `patches/compute_cap-sm87-fix.patch` | candle `compute_cap_matching(87,87)` bug fix |
+| `scripts/verify-tei.sh` | Three-stage verification script (compile → install → function) |
 
 ---
 

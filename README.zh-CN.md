@@ -164,7 +164,7 @@ HuggingFace TEI 官方只发布 **x86 CUDA** 预编译镜像。Jetson 是 **ARM6
 
 | 检查 | 结果 | 方式 |
 | --- | --- | --- |
-| CUDA 12.9 遗留 PTX 缓存 | ✅ 最终编译前清理 | `build-tei-jetson.sh` 隔离 Candle CUDA output、fingerprint 和 rlib |
+| CUDA 12.9 遗留 PTX 缓存 | ✅ 最终编译前清理 | `scripts/build-tei-jetson.sh` 隔离 Candle CUDA output、fingerprint 和 rlib |
 | Candle `cast.ptx` 版本 | ✅ `.version 8.5` | 不是 CUDA 12.6 PTX 时构建 fail closed |
 | TEI kernel 加载 | ✅ 无 `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | 最终运行时验收 |
 
@@ -215,7 +215,7 @@ curl -sL "https://raw.githubusercontent.com/huggingface/text-embeddings-inferenc
   -o cuda-entrypoint.sh && chmod +x cuda-entrypoint.sh
 
 # 构建精简运行时镜像（~30 秒）
-docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+docker build -f docker/Dockerfile.tei-runtime -t tei:jetson-runtime .
 ```
 
 > **二进制兼容性**：`text-embeddings-router-sm87-cuda126` 适用于
@@ -228,32 +228,36 @@ docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
 
 ```bash
 # 获取 TEI 源码（用 codeload tarball，不用 git clone——git-lfs 导致不完整）
-curl -sL "https://codeload.github.com/huggingface/text-embeddings-inference/tar.gz/refs/heads/main" | tar xz
-mv text-embeddings-inference-main tei-src && cd tei-src
+mkdir -p tei-src
+curl -sL "https://codeload.github.com/huggingface/text-embeddings-inference/tar.gz/refs/heads/main" \
+  | tar xz -C tei-src --strip-components=1
 
 # 获取缺失的 cuda-entrypoint.sh
 curl -sL "https://raw.githubusercontent.com/huggingface/text-embeddings-inference/main/cuda-entrypoint.sh" \
-  -o cuda-entrypoint.sh && chmod +x cuda-entrypoint.sh
+  -o tei-src/cuda-entrypoint.sh && chmod +x tei-src/cuda-entrypoint.sh
 
 # 应用 compute_cap sm_87 修复
-patch -p1 < ../compute_cap-sm87-fix.patch
+patch -d tei-src -p1 < patches/compute_cap-sm87-fix.patch
 
 # 步骤 A：构建 builder 镜像（cargo chef cook 预编译依赖，4-7 小时）
-docker build --target builder --platform linux/arm64 \
+docker build -f docker/Dockerfile.tei-builder \
+  --target builder \
+  --platform linux/arm64 \
   --build-arg CUDA_COMPUTE_CAP=87 \
   --build-arg CARGO_BUILD_JOBS=1 \
   --build-arg RAYON_NUM_THREADS=1 \
-  -t tei:builder .
+  -t tei:builder \
+  tei-src
 
 # 步骤 B：用硬 CPU/内存限制执行 dynamic-linking 最终编译
-TEI_BUILD_CONTAINER=tei-build bash build-tei-jetson.sh
+TEI_BUILD_CONTAINER=tei-build bash scripts/build-tei-jetson.sh
 
 # 等待编译完成
 docker logs -f tei-build   # 看到 BUILD_OK 或 Finished
 
 # 步骤 C：拷贝二进制 + 创建精简运行时镜像
 docker cp tei-build:/usr/src/target/release/text-embeddings-router .
-docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+docker build -f docker/Dockerfile.tei-runtime -t tei:jetson-runtime .
 ```
 
 > **想跳过 flash attention 编译（省 6 小时）？**
@@ -264,7 +268,7 @@ docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
 
 ```bash
 # 复制 compose 模板
-cp docker-compose.tei.yml docker-compose.override.yml
+cp docker/docker-compose.tei.yml docker-compose.override.yml
 # 启动 TEI 服务
 docker compose up -d tei-embedding tei-reranker
 # 等待模型加载（约 30 秒）
@@ -276,7 +280,7 @@ docker logs -f agent-studio-tei-embedding-1  # 看到 "Starting ... on Cuda(...)
 > ✅ **已验证**：2026-08-12，Jetson Orin NX 16GB，JetPack 6.2.3，CUDA 12.6。**20/20 通过。**
 
 ```bash
-bash verify-tei.sh all
+bash scripts/verify-tei.sh all
 ```
 
 完整验收方法、固定测试输入、实测结果和兼容性说明见
@@ -358,7 +362,7 @@ bash verify-tei.sh all
 | hdim256 | 4 | 28-40 分钟 |
 
 历史 JOBS=3 并行构建约 3-4 小时，但这不是安全基线：单个 build script 仍可能启动多个
-`nvcc`/`cicc`。请使用 `build-tei-jetson.sh`，通过 Docker cgroup 给宿主系统保留 CPU 和内存。
+`nvcc`/`cicc`。请使用 `scripts/build-tei-jetson.sh`，通过 Docker cgroup 给宿主系统保留 CPU 和内存。
 
 ### 为什么 JOBS=2 会 OOM 死机
 
@@ -373,7 +377,7 @@ bash verify-tei.sh all
   总计 .......................... ~17GB > 16GB → swap 风暴 → 死机
 ```
 
-**必须使用 `build-tei-jetson.sh`**。它同时设置 Docker `--cpus=4 --memory=10g`、
+**必须使用 `scripts/build-tei-jetson.sh`**。它同时设置 Docker `--cpus=4 --memory=10g`、
 `CARGO_BUILD_JOBS=1`、`RAYON_NUM_THREADS=1`、`CMAKE_BUILD_PARALLEL_LEVEL=1` 和
 `NVCC_THREADS=1`。
 
@@ -383,11 +387,11 @@ bash verify-tei.sh all
 
 | 文件 | 用途 |
 | --- | --- |
-| `Dockerfile.tei-builder` | 编译用（Rust 工具链 + nvcc + USTC 镜像 + compute_cap 修复） |
-| `Dockerfile.tei-runtime` | 精简运行时镜像（~200MB，不含编译工具链） |
-| `docker-compose.tei.yml` | 服务编排（CUDA 库挂载 + nvhost 设备） |
-| `compute_cap-sm87-fix.patch` | candle `compute_cap_matching(87,87)` bug 修复 |
-| `verify-tei.sh` | 三阶段验收脚本（编译 → 安装 → 功能） |
+| `docker/Dockerfile.tei-builder` | 编译用（Rust 工具链 + nvcc + USTC 镜像 + compute_cap 修复） |
+| `docker/Dockerfile.tei-runtime` | 精简运行时镜像（~200MB，不含编译工具链） |
+| `docker/docker-compose.tei.yml` | 服务编排（CUDA 库挂载 + nvhost 设备） |
+| `patches/compute_cap-sm87-fix.patch` | candle `compute_cap_matching(87,87)` bug 修复 |
+| `scripts/verify-tei.sh` | 三阶段验收脚本（编译 → 安装 → 功能） |
 
 ---
 

@@ -12,6 +12,7 @@ models/
 data/
 
 # Build artifacts
+tei-src/
 target/
 tmp/
 

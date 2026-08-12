@@ -31,15 +31,15 @@ docker compose up -d tei-embedding tei-reranker
 再执行三阶段验收：
 
 ```bash
-bash verify-tei.sh all
+bash scripts/verify-tei.sh all
 ```
 
 排查时可只跑单阶段：
 
 ```bash
-bash verify-tei.sh 1   # 构建与运行时镜像检查
-bash verify-tei.sh 2   # 容器、health、GPU 检查
-bash verify-tei.sh 3   # embedding/rerank API 检查
+bash scripts/verify-tei.sh 1   # 构建与运行时镜像检查
+bash scripts/verify-tei.sh 2   # 容器、health、GPU 检查
+bash scripts/verify-tei.sh 3   # embedding/rerank API 检查
 ```
 
 只有全部必需检查通过时，脚本才返回退出码 `0`。

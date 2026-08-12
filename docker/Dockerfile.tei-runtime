@@ -1,10 +1,10 @@
 # =============================================================================
-# Dockerfile.tei-runtime — TEI 精简运行时镜像（不含编译工具链）
+# docker/Dockerfile.tei-runtime — TEI 精简运行时镜像（不含编译工具链）
 # =============================================================================
 # 镜像用途：在 Jetson Orin（sm_87, JetPack 6.2, CUDA 12.6）上运行 TEI 推理服务。
 #
 # 构建前提：
-#   1. 已通过 Dockerfile.tei-builder 编译出 text-embeddings-router 二进制
+#   1. 已通过 docker/Dockerfile.tei-builder 编译出 text-embeddings-router 二进制
 #   2. 二进制位于构建上下文的 text-embeddings-router 路径
 #   3. 二进制使用 dynamic-linking feature，运行时从宿主加载 CUDA/cuBLAS
 #
@@ -19,7 +19,7 @@
 #   - TEI 镜像只含二进制，CUDA 库从宿主挂载（版本必须匹配）
 #
 # 构建命令（在 Jetson 上，binary 在当前目录）：
-#   docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+#   docker build -f docker/Dockerfile.tei-runtime -t tei:jetson-runtime .
 #
 # 镜像大小：约 200MB（vs 编译镜像 7.89GB）
 # =============================================================================

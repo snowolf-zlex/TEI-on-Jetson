@@ -16,8 +16,10 @@
 # 上游 issue：https://github.com/huggingface/text-embeddings-inference/issues/467
 # 适用版本：candle rev 6381023982251959a2c9bab7378b3013304e192b（TEI 1.9.3）
 #
-# 用法（在 TEI 源码根目录执行）：
-#   patch -p1 < backends/candle/patches/compute_cap-sm87-fix.patch
+# 用法（在本仓库根目录执行，TEI 源码位于 tei-src/）：
+#   patch -d tei-src -p1 < patches/compute_cap-sm87-fix.patch
+# 或在 TEI 源码根目录执行：
+#   patch -p1 < /path/to/TEI-on-Jetson/patches/compute_cap-sm87-fix.patch
 # 或手动 sed（NX 上实际使用的方式）：
 #   sed -i 's|(80..=89, 80) => true,|(80..=89, 80..=89) => true,|' backends/candle/src/compute_cap.rs
 #   sed -i '/(86..=89, 80..=86) => true,/d' backends/candle/src/compute_cap.rs

@@ -1,5 +1,5 @@
 # =============================================================================
-# Dockerfile.tei-builder — TEI 编译镜像（在 Jetson 上原生构建）
+# docker/Dockerfile.tei-builder — TEI 编译镜像（在 Jetson 上原生构建）
 # =============================================================================
 # 用途：在 Jetson Orin（sm_87, JetPack 6.2, CUDA 12.6）上编译 TEI 二进制。
 #
@@ -15,26 +15,17 @@
 #   3. 源码获取：codeload tarball（git-lfs 导致 git clone 不完整）
 #   4. compute_cap bug 修复：apply patch 后编译
 #
-# 构建命令（在 Jetson 上，挂载宿主 CUDA toolkit）：
-#   docker build -f Dockerfile.tei-builder \
+# 构建命令（在仓库根目录执行；TEI 源码已解压到 tei-src/）：
+#   docker build -f docker/Dockerfile.tei-builder \
+#     --target builder \
 #     --platform linux/arm64 \
 #     --build-arg CUDA_COMPUTE_CAP=87 \
 #     --build-arg CARGO_BUILD_JOBS=1 \
 #     --build-arg RAYON_NUM_THREADS=1 \
 #     -t tei:builder \
-#     .
+#     tei-src
 #
-#   # 然后 bind mount 宿主 CUDA 做最终编译：
-#   docker run --rm --runtime runc --cpus=4 --memory=10g --memory-swap=10g \
-#     -e CUDA_COMPUTE_CAP=87 \
-#     -e CARGO_BUILD_JOBS=1 \
-#     -e RAYON_NUM_THREADS=1 \
-#     -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
-#     -e NVCC_THREADS=1 \
-#     -v /usr/local/cuda:/usr/local/cuda:ro \
-#     tei:builder \
-#     bash -c "cd /usr/src && cargo build --release --bin text-embeddings-router \
-#       -F candle-cuda -F dynamic-linking -F http --no-default-features"
+#   # 然后通过 scripts/build-tei-jetson.sh bind mount 宿主 CUDA 做最终编译。
 #
 # 编译时间：
 #   - chef cook（依赖预编译）：4-7 小时（candle-flash-attn 33 个 CUDA kernel）
@@ -124,7 +115,7 @@ COPY Cargo.lock ./
 RUN echo "${TEI_CARGO_LOCK_SHA256}  Cargo.lock" | sha256sum -c -
 
 # 修复 compute_cap_matching(87, 87) bug
-# 参考: config/jetson-tei/compute_cap-sm87-fix.patch
+# 参考: patches/compute_cap-sm87-fix.patch
 RUN sed -i 's|(80..=89, 80) => true,|(80..=89, 80..=89) => true,|' \
       backends/candle/src/compute_cap.rs && \
     sed -i '/(86..=89, 80..=86) => true,/d' \
@@ -138,8 +129,5 @@ RUN cargo build --release --bin text-embeddings-router \
     -F candle-cuda -F dynamic-linking -F http --no-default-features && sccache -s
 
 # ─── 导出 builder 镜像（用于增量编译） ───────────────────────────────────────
-# docker build --target builder -t tei:builder .
+# docker build -f docker/Dockerfile.tei-builder --target builder -t tei:builder tei-src
 # 最终编译统一通过 scripts/build-tei-jetson.sh，禁止绕过资源上限手写 docker run。
-# docker run --rm --runtime runc -v /usr/local/cuda:/usr/local/cuda:ro tei:builder \
-#   bash -c "cd /usr/src && cargo build --release --bin text-embeddings-router \
-#     -F candle-cuda -F dynamic-linking -F http --no-default-features"

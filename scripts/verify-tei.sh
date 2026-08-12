@@ -3,7 +3,7 @@
 # verify-tei-jetson.sh — TEI on Jetson 三阶段验收脚本
 # =============================================================================
 # 用法：在 Jetson 上执行（需 TEI 服务已启动）
-#   bash verify-tei.sh [stage]
+#   bash scripts/verify-tei.sh [stage]
 #
 # 参数：
 #   1    = 只跑阶段 1（编译验收）

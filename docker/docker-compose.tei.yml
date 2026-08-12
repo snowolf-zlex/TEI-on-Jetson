@@ -1,11 +1,11 @@
 # =============================================================================
-# docker-compose.tei.yml — Jetson Orin TEI 服务模板
+# docker/docker-compose.tei.yml — Jetson Orin TEI 服务模板
 # =============================================================================
 # 用法：在 Jetson 上复制为 docker-compose.override.yml（受保护，不入 Git）
-#   cp config/jetson-tei/docker-compose.tei.yml docker-compose.override.yml
+#   cp docker/docker-compose.tei.yml docker-compose.override.yml
 #
 # 前提：
-#   1. tei:jetson-runtime 镜像已构建（Dockerfile.tei-runtime）
+#   1. tei:jetson-runtime 镜像已构建（docker/Dockerfile.tei-runtime）
 #   2. ~/models/bge-m3 和 ~/models/bge-reranker-v2-m3 已下载
 #   3. Jetson 宿主 CUDA 12.6（JetPack 6.2.x）
 #
