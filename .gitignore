@@ -1,0 +1,27 @@
+# Compiled binary (distributed via GitHub Releases, not Git)
+text-embeddings-router
+text-embeddings-router-*
+*.bin
+
+# Docker images
+*.tar
+*.tar.gz
+
+# Model files (download separately)
+models/
+data/
+
+# Build artifacts
+target/
+tmp/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

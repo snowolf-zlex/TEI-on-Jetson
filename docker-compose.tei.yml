@@ -1,0 +1,104 @@
+# =============================================================================
+# docker-compose.tei.yml — Jetson Orin TEI 服务模板
+# =============================================================================
+# 用法：在 Jetson 上复制为 docker-compose.override.yml（受保护，不入 Git）
+#   cp config/jetson-tei/docker-compose.tei.yml docker-compose.override.yml
+#
+# 前提：
+#   1. tei:jetson-runtime 镜像已构建（Dockerfile.tei-runtime）
+#   2. ~/models/bge-m3 和 ~/models/bge-reranker-v2-m3 已下载
+#   3. Jetson 宿主 CUDA 12.6（JetPack 6.2.x）
+#
+# 服务端口（内部）：
+#   tei-embedding → http://tei-embedding:8080  (BGE-m3, 1024 维)
+#   tei-reranker  → http://tei-reranker:8080   (bge-reranker-v2-m3)
+#
+# 宿主端口（调试用，仅 127.0.0.1）：
+#   8083 → embedding, 8084 → reranker
+# =============================================================================
+
+services:
+  tei-embedding:
+    image: tei:jetson-runtime
+    container_name: agent-studio-tei-embedding-1
+    runtime: nvidia
+    environment:
+      # 跳过 nvidia-container-runtime 的 CUDA 版本检查（12.9 镜像 vs 12.6 driver）
+      NVIDIA_DISABLE_REQUIRE: "true"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # 模型与端口
+      MODEL_ID: /data/bge-m3
+      PORT: "8080"
+      MAX_BATCH_TOKENS: "16384"
+      MAX_CONCURRENT_REQUESTS: "32"
+      USE_FLASH_ATTENTION: "true"
+      LOGGING_LEVEL: info
+      # CUDA 库查找路径（Jetson Tegra driver + CUDA runtime）
+      LD_LIBRARY_PATH: "/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/nvidia"
+    volumes:
+      # 模型文件（只读）
+      - ${HOME}/models:/data:ro
+      # Jetson CUDA 12.6 runtime 库（覆盖镜像中的 12.9）
+      - /usr/local/cuda/lib64:/usr/local/cuda/lib64:ro
+      # Tegra GPU driver 库
+      - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
+      - /usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/nvidia:ro
+      # 隐藏 CUDA compat 目录（防止 entrypoint 把 12.9 compat driver 加到 LD_LIBRARY_PATH 最前面）
+      - /tmp:/usr/local/cuda/compat
+    devices:
+      # Jetson Tegra GPU 设备节点（CUDA 内存分配需要 nvhost）
+      - /dev/nvhost-as-gpu
+      - /dev/nvhost-ctrl-gpu
+      - /dev/nvhost-gpu
+      - /dev/nvhost-dbg-gpu
+      - /dev/nvhost-ctxsw-gpu
+      - /dev/nvhost-sched-gpu
+      - /dev/nvhost-tsg-gpu
+    ports:
+      - "127.0.0.1:8083:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s
+
+  tei-reranker:
+    image: tei:jetson-runtime
+    container_name: agent-studio-tei-reranker-1
+    runtime: nvidia
+    environment:
+      NVIDIA_DISABLE_REQUIRE: "true"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      MODEL_ID: /data/bge-reranker-v2-m3
+      PORT: "8080"
+      MAX_CONCURRENT_REQUESTS: "16"
+      USE_FLASH_ATTENTION: "true"
+      LOGGING_LEVEL: info
+      LD_LIBRARY_PATH: "/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/nvidia"
+    volumes:
+      - ${HOME}/models:/data:ro
+      - /usr/local/cuda/lib64:/usr/local/cuda/lib64:ro
+      - /usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/tegra:ro
+      - /usr/lib/aarch64-linux-gnu/nvidia:/usr/lib/aarch64-linux-gnu/nvidia:ro
+      - /tmp:/usr/local/cuda/compat
+    devices:
+      - /dev/nvhost-as-gpu
+      - /dev/nvhost-ctrl-gpu
+      - /dev/nvhost-gpu
+      - /dev/nvhost-dbg-gpu
+      - /dev/nvhost-ctxsw-gpu
+      - /dev/nvhost-sched-gpu
+      - /dev/nvhost-tsg-gpu
+    ports:
+      - "127.0.0.1:8084:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 120s

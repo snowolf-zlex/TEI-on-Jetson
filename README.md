@@ -1,1 +1,340 @@
-# TEI-on-Jetson
+# TEI on Jetson
+
+**English** | [简体中文](README.zh-CN.md)
+
+> Run [HuggingFace TEI](https://github.com/huggingface/text-embeddings-inference) (Text Embeddings Inference)
+> locally on NVIDIA Jetson Orin, using GPU acceleration for embedding and reranker inference.
+> Reduces latency from 80-150ms (SaaS API) to 5-30ms (local GPU).
+
+## Table of Contents
+
+- [Why This Project](#why-this-project)
+- [Compatibility](#compatibility)
+- [Solution Evolution (8 Iterations)](#solution-evolution-8-iterations)
+- [Quick Start](#quick-start)
+  - [Option A: Download Pre-built Binary (Recommended)](#option-a-download-pre-built-binary-recommended-1-min)
+  - [Option B: Build from Source](#option-b-build-from-source-customizable-5-9-hours)
+- [Build Time Analysis](#build-time-analysis)
+- [Files](#files)
+- [Runtime Configuration](#runtime-configuration)
+- [Known Limitations](#known-limitations)
+- [FAQ](#faq)
+- [License](#license)
+
+## Why This Project
+
+HuggingFace TEI only ships **x86 CUDA** pre-built images. Jetson is **ARM64 + Tegra GPU** with three incompatibilities:
+
+1. No arm64 manifest in official images
+2. Standard `nvidia/cuda` image's cuBLAS is incompatible with Jetson Tegra driver
+3. candle (TEI's ML backend) has an sm_87 compute capability detection bug
+
+This project documents the complete solution — from compilation, debugging, to deployment verification.
+
+---
+
+## Compatibility
+
+### Minimum Requirements
+
+| Requirement | Version | Reason |
+| --- | --- | --- |
+| GPU | Orin family (**sm_87**) | nvprune generates sm_80+sm_87 SASS code |
+| JetPack | **6.x** (CUDA 12.x) | candle's cudarc uses CUDA 12+ APIs |
+| RAM (compile) | **≥16GB** | candle-flash-attn compilation peaks at ~10GB |
+| RAM (runtime) | **≥8GB** | Model resident ~3GB + system + GPU memory |
+
+### Device × JetPack Matrix
+
+| Device | sm | JetPack 6 (CUDA 12.6) | JetPack 5 (CUDA 11.4) | JetPack 4 (CUDA 10.2) |
+| --- | --- | --- | --- | --- |
+| AGX Orin 64GB | sm_87 | ✅ **Best** | ❌ CUDA too old | ❌ Not supported |
+| AGX Orin 32GB | sm_87 | ✅ | ❌ | ❌ |
+| Orin NX 16GB | sm_87 | ✅ **Verified** | ❌ | ❌ |
+| Orin NX 8GB | sm_87 | ⚠️ Tight for compile, OK for runtime | ❌ | ❌ |
+| Orin Nano 8GB | sm_87 | ⚠️ Runtime only (pre-built) | ❌ | ❌ |
+| Orin Nano 4GB | sm_87 | ❌ Not enough RAM | ❌ | ❌ |
+| Xavier NX / AGX | sm_72 | ❌ JP6 not supported | ❌ sm_72 | ❌ |
+| TX2 | sm_62 | ❌ | ❌ | ❌ |
+| Nano / TX1 | sm_53 | ❌ | ❌ | ❌ |
+
+**JP5 (CUDA 11.4) doesn't work**: Even though Orin on JP5 is sm_87, candle's cudarc still requires CUDA 12+ APIs.
+
+---
+
+## Solution Evolution (8 Iterations)
+
+| # | Approach | Result | Root Cause |
+| --- | --- | --- | --- |
+| ① | Mac buildx cross-compile arm64 | ❌ | Mac Docker daemon can't reach Docker Hub (EOF) |
+| ② | NX native build, JOBS=2 | ❌ OOM crash | candle-flash-attn ~4GB/process, peak 17GB > 16GB |
+| ③ | NX native build, JOBS=1 | ✅ Image built | 9 hours (flash-attn = 67% of time) |
+| ④ | Start container `runtime: nvidia` | ❌ | nvidia-container-runtime version check (cuda≥12.9 vs driver 12.6) |
+| ⑤ | `NVIDIA_DISABLE_REQUIRE` + lib mount | ❌ | entrypoint compat logic puts 12.9 driver first in LD_LIBRARY_PATH |
+| ⑥ | Override entrypoint to skip compat | ❌ | candle `compute_cap_matching(87,87)` returns false (source bug) |
+| ⑦ | Fix compute_cap.rs | ❌ | cuBLAS 12.9 static-linked vs driver 12.6 → `CUBLAS_STATUS_ALLOC_FAILED` |
+| ⑧ | **Bind mount host CUDA 12.6 toolkit** | ✅ | cuBLAS 12.6 matches driver exactly |
+
+**Key lesson**: cuBLAS is **statically linked** into the binary (`--features static-linking`).
+The compile-time CUDA version must **exactly match** the runtime driver version. Standard `nvidia/cuda`
+images don't sync with Jetson Tegra driver — you must use **host CUDA toolkit bind mount** for compilation.
+
+---
+
+## Quick Start
+
+### Prerequisites (on Jetson, required for both options)
+
+```bash
+# Verify environment
+cat /etc/nv_tegra_release          # JetPack 6.x (R36.x)
+/usr/local/cuda/bin/nvcc --version # CUDA 12.x
+free -h                            # ≥16GB (compile) or ≥8GB (runtime only)
+
+# Verify host cuBLAS works (must pass)
+cat > /tmp/cublas_test.cu << 'EOF'
+#include <cstdio>
+#include <cublas_v2.h>
+int main() {
+    cublasHandle_t h;
+    printf("cublasCreate: %d\n", (int)cublasCreate(&h));
+}
+EOF
+/usr/local/cuda/bin/nvcc -o /tmp/cublas_test /tmp/cublas_test.cu -lcublas
+/tmp/cublas_test  # Must output: cublasCreate: 0
+
+# Download models (use hf-mirror, direct huggingface.co times out)
+pip3 install --user huggingface_hub
+export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1
+hf download BAAI/bge-m3 --exclude "*.DS_Store" --local-dir ~/models/bge-m3
+hf download BAAI/bge-reranker-v2-m3 --exclude "*.DS_Store" --local-dir ~/models/bge-reranker-v2-m3
+```
+
+### Option A: Download Pre-built Binary (Recommended, ~1 min)
+
+Skip the 5-9 hour compilation. Download the pre-built binary (1.1GB, includes sm_87 fix) from GitHub Releases.
+
+```bash
+# Download pre-built binary (aarch64, CUDA 12.6, sm_87)
+# Replace VERSION with actual release tag (e.g., v0.1.0)
+curl -L "https://github.com/snowolf-zlex/TEI-on-Jetson/releases/download/VERSION/text-embeddings-router-sm87-cuda126" \
+  -o text-embeddings-router
+chmod +x text-embeddings-router
+
+# Get cuda-entrypoint.sh
+curl -sL "https://raw.githubusercontent.com/huggingface/text-embeddings-inference/main/cuda-entrypoint.sh" \
+  -o cuda-entrypoint.sh && chmod +x cuda-entrypoint.sh
+
+# Build slim runtime image (~30 seconds)
+docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+```
+
+> **Binary compatibility**: `text-embeddings-router-sm87-cuda126` works on
+> JetPack 6.x + Orin sm_87 + CUDA 12.6. Not compatible with JP5/Xavier/other CUDA versions.
+> For other configurations, use Option B to build from source.
+
+### Option B: Build from Source (Customizable, 5-9 hours)
+
+For scenarios requiring source modifications, disabling flash attention, or different CUDA versions.
+
+```bash
+# Get TEI source (use codeload tarball, not git clone — git-lfs causes incomplete checkout)
+curl -sL "https://codeload.github.com/huggingface/text-embeddings-inference/tar.gz/refs/heads/main" | tar xz
+mv text-embeddings-inference-main tei-src && cd tei-src
+
+# Get missing cuda-entrypoint.sh
+curl -sL "https://raw.githubusercontent.com/huggingface/text-embeddings-inference/main/cuda-entrypoint.sh" \
+  -o cuda-entrypoint.sh && chmod +x cuda-entrypoint.sh
+
+# Apply compute_cap sm_87 fix
+patch -p1 < ../compute_cap-sm87-fix.patch
+
+# Step A: Build builder image (cargo chef cook pre-compiles dependencies, 4-7 hours)
+docker build --target builder --platform linux/arm64 \
+  --build-arg CUDA_COMPUTE_CAP=87 \
+  --build-arg CARGO_BUILD_JOBS=1 \
+  --build-arg RAYON_NUM_THREADS=1 \
+  -t tei:builder .
+
+# Step B: Bind mount host CUDA 12.6 toolkit for final compilation (50 min ~ 5 hours)
+docker run -d --name tei-build --runtime runc \
+  -e CUDA_COMPUTE_CAP=87 \
+  -e CARGO_BUILD_JOBS=3 \
+  -v /usr/local/cuda:/usr/local/cuda:ro \
+  tei:builder \
+  bash -c 'cd /usr/src && cargo build --release --bin text-embeddings-router \
+    -F candle-cuda -F static-linking -F http --no-default-features && echo BUILD_OK'
+
+# Wait for compilation
+docker logs -f tei-build   # Look for BUILD_OK or Finished
+
+# Step C: Copy binary + build slim runtime image
+docker cp tei-build:/usr/src/target/release/text-embeddings-router .
+docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+```
+
+> **Want to skip flash attention compilation (saves 6 hours)?**
+> Remove flash-attn related args from `--features candle-cuda`,
+> set `USE_FLASH_ATTENTION=false`. Minimal performance impact for embedding/reranker (short sequences).
+
+### Deploy
+
+```bash
+# Copy compose template
+cp docker-compose.tei.yml docker-compose.override.yml
+# Start TEI services
+docker compose up -d tei-embedding tei-reranker
+# Wait for model loading (~30 seconds)
+docker logs -f agent-studio-tei-embedding-1  # Look for "Starting Bert model on Cuda(0)"
+```
+
+### Verify
+
+```bash
+bash verify-tei.sh all
+```
+
+Expected output:
+```
+✓ Image tei:jetson-runtime exists
+✓ Binary is ARM64 ELF
+✓ compute_cap sm_87 fix included
+✓ tei-embedding container running
+✓ embedding using GPU (logs contain Cuda)
+✓ embedding /health returns ready
+✓ embedding returns 1024-dim vector
+✓ embedding average latency: 12.3ms
+✓ rerank returns 3 results (with score)
+═══════════════════════════════════════════════════════════════
+  Result: 10 passed / 0 failed
+═══════════════════════════════════════════════════════════════
+```
+
+---
+
+## Build Time Analysis
+
+### First Complete Build (Jetson Orin NX 16GB, JOBS=1)
+
+```
+9-hour breakdown:
+├── nvidia/cuda image pull .......... 6 min
+├── apt + sccache ................... 25 min (Jetson apt is slow)
+├── rustup installer ............... 18.5 min (AWS CloudFront unreliable)
+├── Rust toolchain ................. 15 min (USTC mirror)
+├── ★ candle-flash-attn 33 kernels . 6 hours (67% of total time)
+├── Non-CUDA Rust crates ........... 40 min
+├── Final cargo build .............. 30 min
+└── Image export ................... 72 sec
+```
+
+### candle-flash-attn 33 CUDA Kernel Compilation Times
+
+| head_dim | Variants | Per-kernel (JOBS=1) |
+| --- | --- | --- |
+| hdim32 | 4 | 5-8 min |
+| hdim64 | 4 | 8-12 min |
+| hdim96 | 4 | 10-14 min |
+| hdim128 | 4 | 14-20 min |
+| hdim160 | 4 | 17-23 min |
+| hdim192 | 4 | 20-25 min |
+| hdim224 | 4 | 22-28 min |
+| hdim256 | 4 | 28-40 min |
+
+With JOBS=3 parallel: ~3-4 hours (each cicc process ~4GB, 3 parallel needs ~12GB RAM).
+
+### Why JOBS=2 Causes OOM Crash
+
+```
+Memory peak:
+  System + Docker + prod containers .. ~4GB
+  Tegra GPU memory reserve ........... ~1GB
+  cargo + rustc ...................... ~2GB
+  cicc × 2 parallel .................. ~8GB (each ~4GB)
+  rayon internal parallelism ......... ~2GB
+  ─────────────────────────────────────
+  Total ............................. ~17GB > 16GB → swap storm → crash
+```
+
+**Must use `CARGO_BUILD_JOBS=1` + `RAYON_NUM_THREADS=1`, or `JOBS=3` (needs ≥16GB).**
+
+---
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `Dockerfile.tei-builder` | Build image (Rust toolchain + nvcc + USTC mirror + compute_cap fix) |
+| `Dockerfile.tei-runtime` | Slim runtime image (~200MB, no build toolchain) |
+| `docker-compose.tei.yml` | Service orchestration (CUDA lib mounts + nvhost devices + compat hiding) |
+| `compute_cap-sm87-fix.patch` | candle `compute_cap_matching(87,87)` bug fix |
+| `verify-tei.sh` | Three-stage verification script (compile → install → function) |
+
+---
+
+## Runtime Configuration
+
+Standard NVIDIA Docker doesn't need these, but Jetson Tegra requires:
+
+| Config | Reason |
+| --- | --- |
+| bind mount `/usr/local/cuda/lib64` | Override image's CUDA 12.9 libs with host's 12.6 |
+| bind mount `/usr/lib/aarch64-linux-gnu/tegra` | Tegra GPU driver libs (Jetson's `libcuda.so`) |
+| `devices: /dev/nvhost-*` | Jetson GPU device nodes (CUDA memory alloc needs nvhost interface) |
+| bind mount `/tmp → /usr/local/cuda/compat` | Hide CUDA 12.9 compat driver, prevents overriding Tegra driver |
+| `NVIDIA_DISABLE_REQUIRE=true` | Skip nvidia-container-runtime CUDA version check |
+
+---
+
+## Known Limitations
+
+1. **High compilation cost**: First build 5-9 hours; candle-flash-attn's 33 CUDA kernels = 67%
+2. **No incremental compilation**: bindgen_cuda recompiles all CUDA kernels every `cargo build`; changing one line = 4-7 hours
+3. **JetPack version locked**: cuBLAS static-link version must match driver
+4. **Only Orin sm_87 + JetPack 6.x**: Xavier/TX2/Nano and JP5/JP4 not supported
+5. **Flash Attention limited benefit**: 33 kernels have huge compilation cost but minimal benefit for short-sequence embedding/reranker
+
+---
+
+## FAQ
+
+**Q: Why aren't the binary and image in the Git repo?**
+
+Git limits single files to 100MB; the binary is 1.1GB. Pre-built binaries are on
+[GitHub Releases](https://github.com/snowolf-zlex/TEI-on-Jetson/releases) (2GB/file limit).
+Dockerfiles are in the repo — download the binary and build the runtime image in 30 seconds.
+
+**Q: Can I skip candle-flash-attn compilation?**
+
+Yes. Remove `USE_FLASH_ATTENTION=true` from the Dockerfile, use standard attention instead.
+Compilation drops from 9 hours to ~1 hour. Minimal performance impact for embedding/reranker (short sequences).
+
+**Q: Can I use the pre-built image on other Jetson devices?**
+
+Same JetPack 6.2.x Orin series (AGX/NX/Nano 8GB+) can directly `docker load`.
+Different JetPack or non-Orin devices are incompatible. See compatibility matrix above.
+
+**Q: Why not use Ollama for embeddings?**
+
+Ollama's embedding is a "bonus" feature with fewer models, no reranker, and incompatible API.
+TEI is purpose-built for embedding/reranker with OpenAI/Jina-compatible API.
+
+**Q: Do I need this on DGX Spark?**
+
+No. DGX Spark has official TEI pre-built images (Blackwell + CUDA 12.9+), just `docker pull`.
+This project is only for Jetson (Tegra GPU + specific JetPack).
+
+**Q: What version is the Release binary?**
+
+| File | Arch | CUDA | sm | TEI Version | Size |
+| --- | --- | --- | --- | --- | --- |
+| `text-embeddings-router-sm87-cuda126` | aarch64 | 12.6 | sm_87 | 1.9.3 (main) | ~1.1GB |
+
+Binary includes cuBLAS 12.6 static link + compute_cap sm_87 fix + candle-flash-attn (33 CUDA kernels).
+Does not include model files (download separately).
+
+---
+
+## License
+
+MIT

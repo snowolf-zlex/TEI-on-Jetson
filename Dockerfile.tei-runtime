@@ -1,0 +1,51 @@
+# =============================================================================
+# Dockerfile.tei-runtime — TEI 精简运行时镜像（不含编译工具链）
+# =============================================================================
+# 镜像用途：在 Jetson Orin（sm_87, JetPack 6.2, CUDA 12.6）上运行 TEI 推理服务。
+#
+# 构建前提：
+#   1. 已通过 Dockerfile.tei-builder 编译出 text-embeddings-router 二进制
+#   2. 二进制位于构建上下文的 text-embeddings-router 路径
+#   3. cuda-entrypoint.sh 来自 TEI 源码（codeload tarball 含此文件）
+#
+# 运行时依赖（通过 docker-compose bind mount 提供，不打包进镜像）：
+#   - /usr/local/cuda/lib64        ← Jetson 宿主 CUDA 12.6 runtime 库
+#   - /usr/lib/aarch64-linux-gnu/tegra  ← Tegra GPU driver 库
+#   - /dev/nvhost-*                ← Jetson GPU 设备节点
+#   - ~/models/                    ← BGE-m3 + bge-reranker-v2-m3 模型文件
+#
+# 与 office/graphics runner 的区别：
+#   - runner 镜像自带完整运行时（LibreOffice/Chromium 等）
+#   - TEI 镜像只含二进制 + entrypoint，CUDA 库从宿主挂载（版本必须匹配）
+#
+# 构建命令（在 Jetson 上，binary + entrypoint 在当前目录）：
+#   docker build -f Dockerfile.tei-runtime -t tei:jetson-runtime .
+#
+# 镜像大小：约 200MB（vs 编译镜像 7.89GB）
+# =============================================================================
+
+FROM ubuntu:24.04
+
+LABEL org.opencontainers.image.title="Agent Studio TEI Runtime"
+LABEL org.opencontainers.image.description="Text Embeddings Inference for Jetson Orin (sm_87, CUDA 12.6)"
+LABEL org.opencontainers.image.source="https://github.com/huggingface/text-embeddings-inference"
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libssl3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY text-embeddings-router /usr/local/bin/text-embeddings-router
+COPY cuda-entrypoint.sh /entrypoint.sh
+RUN chmod +x /usr/local/bin/text-embeddings-router /entrypoint.sh
+
+ENV HUGGINGFACE_HUB_CACHE=/data \
+    PORT=8080 \
+    USE_FLASH_ATTENTION=true \
+    LD_LIBRARY_PATH="/usr/local/cuda/lib64:/usr/lib/aarch64-linux-gnu/tegra:/usr/lib/aarch64-linux-gnu/nvidia"
+
+EXPOSE 8080
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["--json-output"]

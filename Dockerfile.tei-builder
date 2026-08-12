@@ -1,0 +1,137 @@
+# =============================================================================
+# Dockerfile.tei-builder — TEI 编译镜像（在 Jetson 上原生构建）
+# =============================================================================
+# 用途：在 Jetson Orin（sm_87, JetPack 6.2, CUDA 12.6）上编译 TEI 二进制。
+#
+# 为什么需要这个 Dockerfile：
+#   TEI 官方没有 arm64-cuda 预编译镜像。标准 nvidia/cuda 镜像的 cuBLAS 版本
+#   与 Jetson Tegra driver 不兼容（12.9 vs 12.6），必须用宿主 CUDA toolkit 编译。
+#
+# 编译策略：
+#   1. 基础镜像：nvidia/cuda:12.9.1-devel-ubuntu24.04（唯一有 arm64 manifest 的 devel 镜像）
+#      —— 仅用于 Rust 工具链 + nvcc，cuBLAS 从宿主 bind mount 覆盖
+#   2. 国内镜像加速：USTC rustup + crates.io（SJTU/TUNA 未同步 Rust 1.96.0）
+#   3. 源码获取：codeload tarball（git-lfs 导致 git clone 不完整）
+#   4. compute_cap bug 修复：apply patch 后编译
+#
+# 构建命令（在 Jetson 上，挂载宿主 CUDA toolkit）：
+#   docker build -f Dockerfile.tei-builder \
+#     --platform linux/arm64 \
+#     --build-arg CUDA_COMPUTE_CAP=87 \
+#     --build-arg CARGO_BUILD_JOBS=3 \
+#     --build-arg RAYON_NUM_THREADS=1 \
+#     -t tei:builder \
+#     .
+#
+#   # 然后 bind mount 宿主 CUDA 做最终编译：
+#   docker run --rm --runtime runc \
+#     -e CUDA_COMPUTE_CAP=87 \
+#     -e CARGO_BUILD_JOBS=3 \
+#     -v /usr/local/cuda:/usr/local/cuda:ro \
+#     tei:builder \
+#     bash -c "cd /usr/src && cargo build --release --bin text-embeddings-router \
+#       -F candle-cuda -F static-linking -F http --no-default-features"
+#
+# 编译时间：
+#   - chef cook（依赖预编译）：4-7 小时（candle-flash-attn 33 个 CUDA kernel）
+#   - 最终 cargo build（bind mount CUDA 12.6）：50 分钟
+#   - 总计：5-8 小时（JOBS=1 最安全，JOBS=3 快但需 ≥16GB 内存）
+#
+# 已知坑：
+#   1. JOBS=2 会在 candle-flash-attn 编译时 OOM 死机（每个 cicc ~4GB）
+#   2. cuda-entrypoint.sh 不在 git 仓库（LFS），必须用 codeload tarball
+#   3. SJTU/TUNA 镜像未同步 Rust 1.96.0，用 USTC
+#   4. rustup installer 下载不可控（AWS CloudFront），可能 18 分钟
+# =============================================================================
+
+ARG CUDA_DEVEL_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04
+ARG TEI_REF=main
+
+FROM ${CUDA_DEVEL_IMAGE} AS base-builder
+
+ENV SCCACHE=0.10.0
+ENV RUSTC_WRAPPER=/usr/local/bin/sccache
+ENV PATH="/root/.cargo/bin:${PATH}"
+ENV CARGO_CHEF=0.1.73
+# 国内镜像加速（USTC；SJTU/TUNA 未同步 Rust 1.96.0）
+ENV RUSTUP_DIST_SERVER=https://mirrors.ustc.edu.cn/rust-static
+ENV RUSTUP_UPDATE_ROOT=https://mirrors.ustc.edu.cn/rust-static/rustup
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    curl \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG TARGETARCH
+RUN case "${TARGETARCH}" in \
+    "amd64") SCCACHE_ARCH=x86_64-unknown-linux-musl ;; \
+    "arm64") SCCACHE_ARCH=aarch64-unknown-linux-musl ;; \
+    *) echo "Unsupported arch: ${TARGETARCH}"; exit 1; \
+    esac && \
+    curl -fsSL "https://github.com/mozilla/sccache/releases/download/v${SCCACHE}/sccache-v${SCCACHE}-${SCCACHE_ARCH}.tar.gz" \
+    | tar -xzv --strip-components=1 -C /usr/local/bin "sccache-v${SCCACHE}-${SCCACHE_ARCH}/sccache" && \
+    chmod +x /usr/local/bin/sccache
+
+COPY rust-toolchain.toml rust-toolchain.toml
+RUN curl https://sh.rustup.rs -sSf | bash -s -- -y
+RUN mkdir -p /root/.cargo && \
+    printf '[source.crates-io]\nreplace-with = "ustc"\n[source.ustc]\nregistry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"\n' \
+    > /root/.cargo/config.toml
+RUN cargo install cargo-chef --version ${CARGO_CHEF} --locked
+
+# ─── chef planner ────────────────────────────────────────────────────────────
+FROM base-builder AS planner
+WORKDIR /usr/src
+COPY backends backends
+COPY core core
+COPY router router
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ─── chef cook（预编译依赖，含 CUDA kernel） ─────────────────────────────────
+FROM base-builder AS builder
+ARG CUDA_COMPUTE_CAP=87
+ARG CARGO_BUILD_JOBS=1
+ARG RAYON_NUM_THREADS=1
+
+WORKDIR /usr/src
+
+# nvprune 裁剪 cuBLAS 静态库（sm_80 + sm_87）
+RUN if [ ${CUDA_COMPUTE_CAP} -ge 80 ] && [ ${CUDA_COMPUTE_CAP} -lt 90 ]; then \
+      nvprune --generate-code code=sm_80 --generate-code code=sm_${CUDA_COMPUTE_CAP} \
+        /usr/local/cuda/lib64/libcublas_static.a \
+        -o /usr/local/cuda/lib64/libcublas_static.a; \
+    else \
+      echo "Unsupported CUDA_COMPUTE_CAP: ${CUDA_COMPUTE_CAP}"; exit 1; \
+    fi
+
+COPY --from=planner /usr/src/recipe.json recipe.json
+RUN cargo chef cook --release --features candle-cuda --features static-linking \
+    --no-default-features --recipe-path recipe.json && sccache -s
+
+# ─── apply compute_cap sm_87 fix + COPY 源码 ─────────────────────────────────
+COPY backends backends
+COPY core core
+COPY router router
+COPY Cargo.toml ./
+COPY Cargo.lock ./
+
+# 修复 compute_cap_matching(87, 87) bug
+# 参考: config/jetson-tei/compute_cap-sm87-fix.patch
+RUN sed -i 's|(80..=89, 80) => true,|(80..=89, 80..=89) => true,|' \
+      backends/candle/src/compute_cap.rs && \
+    sed -i '/(86..=89, 80..=86) => true,/d' \
+      backends/candle/src/compute_cap.rs
+
+# 最终编译（在此阶段之后，需要 bind mount 宿主 CUDA 12.6 toolkit 重编译，
+# 以确保 cuBLAS 版本与 Jetson driver 匹配）
+RUN cargo build --release --bin text-embeddings-router \
+    -F candle-cuda -F static-linking -F http --no-default-features && sccache -s
+
+# ─── 导出 builder 镜像（用于增量编译） ───────────────────────────────────────
+# docker build --target builder -t tei:builder .
+# docker run --rm --runtime runc -v /usr/local/cuda:/usr/local/cuda:ro tei:builder \
+#   bash -c "cd /usr/src && cargo build --release --bin text-embeddings-router \
+#     -F candle-cuda -F static-linking -F http --no-default-features"
