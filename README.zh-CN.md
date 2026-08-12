@@ -25,7 +25,7 @@
 
 ### 什么时候需要 TEI
 
-任何需要**文本向量化（embedding）或相关性重排（reranker）**的应用：
+任何需要 **文本向量化（embedding）或相关性重排（reranker）** 的应用：
 
 | 场景 | 用 embedding 做什么 | 用 reranker 做什么 |
 | --- | --- | --- |
