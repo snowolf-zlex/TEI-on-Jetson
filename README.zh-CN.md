@@ -138,7 +138,7 @@ HuggingFace TEI 官方只发布 **x86 CUDA** 预编译镜像。Jetson 是 **ARM6
 | ⑦ | 修复 compute_cap.rs | ❌ | cuBLAS 12.9 静态链接 vs driver 12.6 → `CUBLAS_STATUS_ALLOC_FAILED` |
 | ⑧ | **bind mount 宿主 CUDA 12.6 toolkit** | ✅ 编译通过 | cuBLAS 12.6 匹配 driver，但运行仍 `CUBLAS_STATUS_ALLOC_FAILED` |
 | ⑨ | **`dynamic-linking` 替代 `static-linking`** | ✅ cuBLAS 解决 | nvprune 静态裁剪的 cuBLAS 损坏；动态链接宿主 `libcublas.so` 成功 |
-| ⑩ | PTX 版本不兼容 | ❌ 阻塞中 | `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`——nvcc 生成的 PTX 与 driver 不兼容 |
+| ⑩ | PTX 版本不兼容 → 已修复 | ✅ | 清理 12.9 PTX 缓存污染，强制校验 12.6 PTX 8.5 |
 
 ### cuBLAS 验证状态
 

@@ -139,7 +139,7 @@ The binary and instructions in this repo were built and tested on:
 | ⑦ | Fix compute_cap.rs | ❌ | cuBLAS 12.9 static-linked vs driver 12.6 → `CUBLAS_STATUS_ALLOC_FAILED` |
 | ⑧ | **Bind mount host CUDA 12.6 toolkit** | ✅ compiles | cuBLAS 12.6 matches driver, but still `CUBLAS_STATUS_ALLOC_FAILED` |
 | ⑨ | **`dynamic-linking` instead of `static-linking`** | ✅ cuBLAS works | nvprune static-cropped cuBLAS broken; dynamic link to host `libcublas.so` works |
-| ⑩ | PTX version mismatch | ❌ Blocked | `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` — nvcc generates PTX incompatible with driver |
+| ⑩ | PTX version mismatch → fixed | ✅ | `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` — fixed by validating CUDA 12.6 PTX, purging 12.9 cache |
 
 ### cuBLAS Verification Status
 
