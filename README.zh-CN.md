@@ -74,6 +74,30 @@ HuggingFace TEI 官方只发布 **x86 CUDA** 预编译镜像。Jetson 是 **ARM6
 
 ## 兼容性
 
+### 验证环境
+
+本仓库的二进制和文档基于以下环境编译和测试：
+
+| 组件 | 版本 | 验证命令 |
+| --- | --- | --- |
+| **设备** | Jetson Orin NX 16GB | `cat /proc/device-tree/model` |
+| **JetPack** | 6.2（L4T R36.5.2） | `cat /etc/nv_tegra_release` |
+| **Ubuntu** | 22.04.5 LTS（Jammy） | `cat /etc/os-release \| grep VERSION` |
+| **内核** | 5.15.199-tegra | `uname -r` |
+| **架构** | aarch64 | `uname -m` |
+| **glibc** | 2.35 | `ldd --version` |
+| **CUDA Toolkit** | 12.6.68 | `nvcc --version` |
+| **cuBLAS** | 12.6.1.4 | `dpkg -l \| grep libcublas` |
+| **cuDNN** | 9.3.0.75 | `dpkg -l \| grep cudnn` |
+| **TensorRT** | 10.3.0.30 | `dpkg -l \| grep libnvinfer` |
+| **PyTorch** | 2.5.0a0+nv24.08 | `python3 -c "import torch; print(torch.__version__)"` |
+| **Python** | 3.10.12 | `python3 --version` |
+| **Docker** | 29.1.3 | `docker --version` |
+| **nvidia-container-toolkit** | 1.16.2 | `dpkg -l \| grep libnvidia-container` |
+| **Rust（编译容器）** | 1.92.0 | `rustc --version` |
+
+> 如果你的版本差异较大（特别是 CUDA、glibc 或 JetPack），预编译二进制可能不适用。请用选项 B 自行编译。
+
 ### 最低要求
 
 | 要求 | 版本 | 原因 |
@@ -112,11 +136,40 @@ HuggingFace TEI 官方只发布 **x86 CUDA** 预编译镜像。Jetson 是 **ARM6
 | ⑤ | `NVIDIA_DISABLE_REQUIRE` + 库挂载 | ❌ | entrypoint 的 compat 逻辑把 12.9 driver 加到 LD_LIBRARY_PATH 最前 |
 | ⑥ | 覆盖 entrypoint 跳过 compat | ❌ | candle `compute_cap_matching(87,87)` 返回 false（源码 bug） |
 | ⑦ | 修复 compute_cap.rs | ❌ | cuBLAS 12.9 静态链接 vs driver 12.6 → `CUBLAS_STATUS_ALLOC_FAILED` |
-| ⑧ | **bind mount 宿主 CUDA 12.6 toolkit** | ✅ | cuBLAS 12.6 编译与 driver 完全匹配 |
+| ⑧ | **bind mount 宿主 CUDA 12.6 toolkit** | ✅ 编译通过 | cuBLAS 12.6 匹配 driver，但运行仍 `CUBLAS_STATUS_ALLOC_FAILED` |
+| ⑨ | **`dynamic-linking` 替代 `static-linking`** | ✅ cuBLAS 解决 | nvprune 静态裁剪的 cuBLAS 损坏；动态链接宿主 `libcublas.so` 成功 |
+| ⑩ | PTX 版本不兼容 | ❌ 阻塞中 | `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`——nvcc 生成的 PTX 与 driver 不兼容 |
 
-**核心教训**：TEI 二进制中 cuBLAS 是**静态链接**的（`--features static-linking`），
-编译时的 CUDA 版本必须与运行时 driver 版本**完全匹配**。标准 `nvidia/cuda` 镜像的 CUDA 版本
-和 Jetson Tegra driver 不同步，必须用**宿主 CUDA toolkit bind mount** 编译。
+### cuBLAS 验证状态
+
+`CUBLAS_STATUS_ALLOC_FAILED` 的根因是 **nvprune**——TEI 的 Dockerfile 在 `static-linking` 模式下
+对 `libcublas_static.a` 执行 nvprune，裁剪掉了 Jetson Tegra 特有的 cuBLAS 代码路径。
+修复方案是 `-F dynamic-linking`——cuBLAS 动态链接宿主的 `libcublas.so`（通过 bind mount）。
+
+**已验证通过：**
+
+| 测试 | 结果 | 方式 |
+| --- | --- | --- |
+| 宿主 cuBLAS 初始化 | ✅ `cublasCreate: 0` | 宿主 nvcc + 宿主 cuBLAS 12.6 |
+| 宿主 cuBLAS Sgemm | ✅ 结果正确 | 2×2 矩阵乘法 |
+| 容器 GPU 内存分配 | ✅ `cudaMalloc: 0` | nvidia runtime 容器 |
+| 容器 cuBLAS 初始化 | ✅ `cublasCreate: 0` | 容器 + bind mount 宿主 CUDA 库 |
+| 容器 cuBLAS Sgemm | ✅ 结果正确 | 动态链接 `libcublas.so.12.6` |
+| **TEI GPU 检测** | ✅ `Cuda(CudaDevice(DeviceId(1)))` | TEI 二进制（dynamic-linking）在容器中 |
+| **TEI cuBLAS 初始化** | ✅ 无 `CUBLAS_STATUS_ALLOC_FAILED` | TEI 启动成功，开始加载模型 |
+
+**阻塞中：**
+
+| 测试 | 错误 | 根因 |
+| --- | --- | --- |
+| TEI kernel 加载 | ❌ `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | nvcc 生成的 PTX 与 Jetson 12.6 driver 不兼容 |
+
+**PTX 问题详情**：编译容器的 nvcc（来自 `nvidia/cuda:12.9.1-devel`）生成的 PTX 被 Jetson 12.6 driver
+拒绝。即使 bind mount 了宿主 CUDA 12.6 到 `/usr/local/cuda`，容器内仍有 `/usr/local/cuda-12.9/`
+内部组件，nvcc 可能混用了 12.6 和 12.9 的文件。
+
+**下一步**：用 `CUDA_COMPUTE_CAP=80` 重新编译（compute_80 PTX 兼容所有 Ampere），
+或确保 nvcc 只使用宿主 12.6 组件，排除 12.9 污染。
 
 ---
 
@@ -202,7 +255,7 @@ docker run -d --name tei-build --runtime runc \
   -v /usr/local/cuda:/usr/local/cuda:ro \
   tei:builder \
   bash -c 'cd /usr/src && cargo build --release --bin text-embeddings-router \
-    -F candle-cuda -F static-linking -F http --no-default-features && echo BUILD_OK'
+    -F candle-cuda -F dynamic-linking -F http --no-default-features && echo BUILD_OK'
 
 # 等待编译完成
 docker logs -f tei-build   # 看到 BUILD_OK 或 Finished

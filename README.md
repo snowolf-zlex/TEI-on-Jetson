@@ -75,6 +75,30 @@ This project documents the complete solution — from compilation, debugging, to
 
 ## Compatibility
 
+### Verified Environment
+
+The binary and instructions in this repo were built and tested on:
+
+| Component | Version | Check Command |
+| --- | --- | --- |
+| **Device** | Jetson Orin NX 16GB | `cat /proc/device-tree/model` |
+| **JetPack** | 6.2 (L4T R36.5.2) | `cat /etc/nv_tegra_release` |
+| **Ubuntu** | 22.04.5 LTS (Jammy) | `cat /etc/os-release \| grep VERSION` |
+| **Kernel** | 5.15.199-tegra | `uname -r` |
+| **Architecture** | aarch64 | `uname -m` |
+| **glibc** | 2.35 | `ldd --version` |
+| **CUDA Toolkit** | 12.6.68 | `nvcc --version` |
+| **cuBLAS** | 12.6.1.4 | `dpkg -l \| grep libcublas` |
+| **cuDNN** | 9.3.0.75 | `dpkg -l \| grep cudnn` |
+| **TensorRT** | 10.3.0.30 | `dpkg -l \| grep libnvinfer` |
+| **PyTorch** | 2.5.0a0+nv24.08 | `python3 -c "import torch; print(torch.__version__)"` |
+| **Python** | 3.10.12 | `python3 --version` |
+| **Docker** | 29.1.3 | `docker --version` |
+| **nvidia-container-toolkit** | 1.16.2 | `dpkg -l \| grep libnvidia-container` |
+| **Rust (in builder)** | 1.92.0 | `rustc --version` |
+
+> If your versions differ significantly (especially CUDA, glibc, or JetPack), the pre-built binary may not work. Use Option B to build from source.
+
 ### Minimum Requirements
 
 | Requirement | Version | Reason |
@@ -113,11 +137,40 @@ This project documents the complete solution — from compilation, debugging, to
 | ⑤ | `NVIDIA_DISABLE_REQUIRE` + lib mount | ❌ | entrypoint compat logic puts 12.9 driver first in LD_LIBRARY_PATH |
 | ⑥ | Override entrypoint to skip compat | ❌ | candle `compute_cap_matching(87,87)` returns false (source bug) |
 | ⑦ | Fix compute_cap.rs | ❌ | cuBLAS 12.9 static-linked vs driver 12.6 → `CUBLAS_STATUS_ALLOC_FAILED` |
-| ⑧ | **Bind mount host CUDA 12.6 toolkit** | ✅ | cuBLAS 12.6 matches driver exactly |
+| ⑧ | **Bind mount host CUDA 12.6 toolkit** | ✅ compiles | cuBLAS 12.6 matches driver, but still `CUBLAS_STATUS_ALLOC_FAILED` |
+| ⑨ | **`dynamic-linking` instead of `static-linking`** | ✅ cuBLAS works | nvprune static-cropped cuBLAS broken; dynamic link to host `libcublas.so` works |
+| ⑩ | PTX version mismatch | ❌ Blocked | `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` — nvcc generates PTX incompatible with driver |
 
-**Key lesson**: cuBLAS is **statically linked** into the binary (`--features static-linking`).
-The compile-time CUDA version must **exactly match** the runtime driver version. Standard `nvidia/cuda`
-images don't sync with Jetson Tegra driver — you must use **host CUDA toolkit bind mount** for compilation.
+### cuBLAS Verification Status
+
+The root cause of `CUBLAS_STATUS_ALLOC_FAILED` was **nvprune** — TEI's Dockerfile runs nvprune on
+`libcublas_static.a` (static linking mode), which corrupts the Tegra-specific cuBLAS code paths.
+The fix is `-F dynamic-linking` — cuBLAS dynamically links to the host's `libcublas.so` via bind mount.
+
+**What's verified working:**
+
+| Test | Result | Method |
+| --- | --- | --- |
+| Host cuBLAS init | ✅ `cublasCreate: 0` | Host nvcc + host cuBLAS 12.6 |
+| Host cuBLAS Sgemm | ✅ Correct result | 2×2 matrix multiply |
+| Container GPU alloc | ✅ `cudaMalloc: 0` | Container with nvidia runtime |
+| Container cuBLAS init | ✅ `cublasCreate: 0` | Container + bind mount host CUDA libs |
+| Container cuBLAS Sgemm | ✅ Correct result | Dynamic-linked `libcublas.so.12.6` |
+| **TEI GPU detection** | ✅ `Cuda(CudaDevice(DeviceId(1)))` | TEI binary (dynamic-linking) in container |
+| **TEI cuBLAS init** | ✅ No `CUBLAS_STATUS_ALLOC_FAILED` | TEI binary starts, model loading begins |
+
+**Blocked on:**
+
+| Test | Error | Root Cause |
+| --- | --- | --- |
+| TEI kernel loading | ❌ `CUDA_ERROR_UNSUPPORTED_PTX_VERSION` | nvcc generates PTX incompatible with Jetson 12.6 driver |
+
+**PTX issue details**: The builder container's nvcc (from `nvidia/cuda:12.9.1-devel`) generates PTX
+that Jetson's 12.6 driver rejects. Even with host CUDA 12.6 bind-mounted to `/usr/local/cuda`,
+the container still has `/usr/local/cuda-12.9/` internal components that nvcc may mix in.
+
+**Next step**: Recompile with `CUDA_COMPUTE_CAP=80` (compute_80 PTX is compatible with all Ampere),
+or ensure nvcc uses only host 12.6 components without any 12.9 contamination.
 
 ---
 
@@ -203,7 +256,7 @@ docker run -d --name tei-build --runtime runc \
   -v /usr/local/cuda:/usr/local/cuda:ro \
   tei:builder \
   bash -c 'cd /usr/src && cargo build --release --bin text-embeddings-router \
-    -F candle-cuda -F static-linking -F http --no-default-features && echo BUILD_OK'
+    -F candle-cuda -F dynamic-linking -F http --no-default-features && echo BUILD_OK'
 
 # Wait for compilation
 docker logs -f tei-build   # Look for BUILD_OK or Finished

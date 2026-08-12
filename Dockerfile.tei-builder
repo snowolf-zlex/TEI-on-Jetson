@@ -9,10 +9,12 @@
 #
 # 编译策略：
 #   1. 基础镜像：nvidia/cuda:12.9.1-devel-ubuntu24.04（唯一有 arm64 manifest 的 devel 镜像）
-#      —— 仅用于 Rust 工具链 + nvcc，cuBLAS 从宿主 bind mount 覆盖
+#      —— 仅用于 Rust 工具链 + nvcc，CUDA 库从宿主 bind mount 覆盖
 #   2. 国内镜像加速：USTC rustup + crates.io（SJTU/TUNA 未同步 Rust 1.96.0）
 #   3. 源码获取：codeload tarball（git-lfs 导致 git clone 不完整）
 #   4. compute_cap bug 修复：apply patch 后编译
+#   5. ★ dynamic-linking（非 static-linking）：cuBLAS 动态链接宿主的 libcublas.so，
+#      避免 nvprune 静态裁剪导致 CUBLAS_STATUS_ALLOC_FAILED
 #
 # 构建命令（在 Jetson 上，挂载宿主 CUDA toolkit）：
 #   docker build -f Dockerfile.tei-builder \
@@ -30,7 +32,7 @@
 #     -v /usr/local/cuda:/usr/local/cuda:ro \
 #     tei:builder \
 #     bash -c "cd /usr/src && cargo build --release --bin text-embeddings-router \
-#       -F candle-cuda -F static-linking -F http --no-default-features"
+#       -F candle-cuda -F dynamic-linking -F http --no-default-features"
 #
 # 编译时间：
 #   - chef cook（依赖预编译）：4-7 小时（candle-flash-attn 33 个 CUDA kernel）
@@ -108,7 +110,7 @@ RUN if [ ${CUDA_COMPUTE_CAP} -ge 80 ] && [ ${CUDA_COMPUTE_CAP} -lt 90 ]; then \
     fi
 
 COPY --from=planner /usr/src/recipe.json recipe.json
-RUN cargo chef cook --release --features candle-cuda --features static-linking \
+RUN cargo chef cook --release --features candle-cuda --features dynamic-linking \
     --no-default-features --recipe-path recipe.json && sccache -s
 
 # ─── apply compute_cap sm_87 fix + COPY 源码 ─────────────────────────────────
@@ -128,10 +130,10 @@ RUN sed -i 's|(80..=89, 80) => true,|(80..=89, 80..=89) => true,|' \
 # 最终编译（在此阶段之后，需要 bind mount 宿主 CUDA 12.6 toolkit 重编译，
 # 以确保 cuBLAS 版本与 Jetson driver 匹配）
 RUN cargo build --release --bin text-embeddings-router \
-    -F candle-cuda -F static-linking -F http --no-default-features && sccache -s
+    -F candle-cuda -F dynamic-linking -F http --no-default-features && sccache -s
 
 # ─── 导出 builder 镜像（用于增量编译） ───────────────────────────────────────
 # docker build --target builder -t tei:builder .
 # docker run --rm --runtime runc -v /usr/local/cuda:/usr/local/cuda:ro tei:builder \
 #   bash -c "cd /usr/src && cargo build --release --bin text-embeddings-router \
-#     -F candle-cuda -F static-linking -F http --no-default-features"
+#     -F candle-cuda -F dynamic-linking -F http --no-default-features"
